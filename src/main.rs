@@ -1386,6 +1386,39 @@ mod tests {
     }
 
     #[test]
+    fn tray_events_restore_the_window_and_control_pausing() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let settings = Settings::default_for(temporary.path());
+        let mut app = app_for_test(temporary.path(), settings);
+        let (tray_tx, tray_rx) = mpsc::channel();
+        app.tray_events = tray_rx;
+        let ctx = egui::Context::default();
+        tray_tx.send("__open__".into())?;
+        let output = ctx.run_logic(&egui::RawInput::default(), |ctx| app.poll(ctx));
+        assert!(
+            output
+                .viewport_commands
+                .values()
+                .flatten()
+                .any(|command| { matches!(command, egui::ViewportCommand::Visible(true)) })
+        );
+        assert!(
+            output
+                .viewport_commands
+                .values()
+                .flatten()
+                .any(|command| { matches!(command, egui::ViewportCommand::Focus) })
+        );
+        tray_tx.send(app.pause_id.0.clone())?;
+        app.poll(&ctx);
+        assert!(app.paused);
+        tray_tx.send(app.resume_id.0.clone())?;
+        app.poll(&ctx);
+        assert!(!app.paused);
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "run during a synthetic indexing workload to measure egui CPU-side response"]
     fn input_to_egui_paint_baseline() -> anyhow::Result<()> {
         let temporary = tempfile::tempdir()?;
