@@ -22,3 +22,30 @@ jobs:
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Test with synthetic files
         run: cargo test --locked
+
+  installer:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Download pinned build dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $downloads = Join-Path $env:RUNNER_TEMP 'llmlocalsearch-dependencies'
+          New-Item -ItemType Directory -Path $downloads | Out-Null
+          Invoke-WebRequest 'https://archive.apache.org/dist/tika/3.3.3/tika-app-3.3.3.jar' -OutFile (Join-Path $downloads 'tika.jar')
+          Invoke-WebRequest 'https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.13%2B9/OpenJDK21U-jre_x64_windows_hotspot_21.0.13_9.zip' -OutFile (Join-Path $downloads 'jre.zip')
+          Invoke-WebRequest 'https://downloads.sourceforge.net/project/nsis/NSIS%203/3.11/nsis-3.11.zip' -OutFile (Join-Path $downloads 'nsis.zip')
+          if ((Get-FileHash -LiteralPath (Join-Path $downloads 'nsis.zip') -Algorithm SHA256).Hash -ne 'C7D27F780DDB6CFFB4730138CD1591E841F4B7EDB155856901CDF5F214394FA1') { throw 'NSIS checksum mismatch' }
+          Expand-Archive -LiteralPath (Join-Path $downloads 'nsis.zip') -DestinationPath $downloads
+      - name: Build installer with verified dependencies
+        shell: pwsh
+        run: |
+          $downloads = Join-Path $env:RUNNER_TEMP 'llmlocalsearch-dependencies'
+          ./scripts/package.ps1 -TikaJar (Join-Path $downloads 'tika.jar') -JavaZip (Join-Path $downloads 'jre.zip') -MakeNsis (Join-Path $downloads 'nsis-3.11/makensis.exe')
+      - name: Verify synthetic installation and data preservation
+        shell: pwsh
+        run: ./tests/installer_smoke.ps1

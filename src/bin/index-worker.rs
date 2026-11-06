@@ -1,7 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-use anyhow::{Context, Result};
-use llmlocalsearch::{index, paths, scanner, text, tika};
+use anyhow::{Context, Result, bail};
+use llmlocalsearch::{index, paths, scanner, settings, text, tika};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashMap;
@@ -35,6 +35,17 @@ fn send_status(state: &str, stats: Option<index::IndexStats>) {
     let _ = writeln!(output, "{value}");
 }
 
+fn send_compaction_progress(stats: index::IndexStats, copied: u64, total: u64) {
+    let mut output = std::io::stdout().lock();
+    let value = serde_json::json!({
+        "state":"optimizing", "files":stats.files, "pending":stats.pending,
+        "indexed":stats.indexed, "failed":stats.failed, "name_only":stats.name_only,
+        "no_text":stats.no_text, "cloud":stats.cloud, "scan_errors":stats.scan_errors,
+        "copied":copied, "total":total
+    });
+    let _ = writeln!(output, "{value}");
+}
+
 fn start_control() -> Arc<Control> {
     let control = Arc::new(Control::default());
     let shared = control.clone();
@@ -60,6 +71,138 @@ fn start_control() -> Arc<Control> {
         shared.stop.store(true, Ordering::Relaxed);
     });
     control
+}
+
+enum UpgradeOutcome {
+    Current,
+    Upgraded,
+    LegacyFallback,
+    Stopped,
+}
+
+fn upgrade_index(
+    connection: &mut Connection,
+    database: &Path,
+    control: &Arc<Control>,
+) -> Result<UpgradeOutcome> {
+    let mut last_report = Instant::now() - Duration::from_secs(2);
+    let mut space_check = Instant::now() - Duration::from_secs(5);
+    loop {
+        if control.stop.load(Ordering::Relaxed) {
+            return Ok(UpgradeOutcome::Stopped);
+        }
+        if control.paused.load(Ordering::Relaxed) || control.resource_paused.load(Ordering::Relaxed)
+        {
+            if last_report.elapsed() >= Duration::from_secs(1) {
+                send_status(
+                    if control.paused.load(Ordering::Relaxed) {
+                        "paused"
+                    } else {
+                        "resource_paused"
+                    },
+                    index::stats(connection).ok(),
+                );
+                last_report = Instant::now();
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        if control.searching.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        let step = (|| -> Result<index::CompactStep> {
+            if space_check.elapsed() >= Duration::from_secs(5) {
+                let directory = database.parent().context("索引目录无效")?;
+                if settings::available_space(directory)? < 256 * 1024 * 1024 {
+                    bail!("索引目录可用空间不足");
+                }
+                space_check = Instant::now();
+            }
+            index::compact_legacy_step(connection, 16)
+        })();
+        match step {
+            Ok(index::CompactStep::Current) => return Ok(UpgradeOutcome::Current),
+            Ok(index::CompactStep::Finished { .. }) => return Ok(UpgradeOutcome::Upgraded),
+            Ok(index::CompactStep::Copying { copied, total }) => {
+                if last_report.elapsed() >= Duration::from_secs(1) {
+                    if let Ok(stats) = index::stats(connection) {
+                        send_compaction_progress(stats, copied, total);
+                    }
+                    last_report = Instant::now();
+                }
+            }
+            Err(_) => {
+                // A failed conversion must not leave the old index silently
+                // write-locked. If cleanup itself fails, keep the old table
+                // queryable and wait for an explicit resume after repair.
+                loop {
+                    match index::abort_legacy_compaction(connection) {
+                        Ok(true) => return Ok(UpgradeOutcome::LegacyFallback),
+                        Ok(false) => return Ok(UpgradeOutcome::Current),
+                        Err(_) => send_status("optimization_blocked", None),
+                    }
+                    loop {
+                        if control.stop.load(Ordering::Relaxed) {
+                            return Ok(UpgradeOutcome::Stopped);
+                        }
+                        if control.rescan.swap(false, Ordering::Relaxed) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn reclaim_space_available(database: &Path) -> Result<bool> {
+    let parent = database.parent().context("索引目录无效")?;
+    let mut wal_name = database.as_os_str().to_os_string();
+    wal_name.push("-wal");
+    let wal = PathBuf::from(wal_name);
+    let size = std::fs::metadata(database)?
+        .len()
+        .saturating_add(std::fs::metadata(wal).map_or(0, |metadata| metadata.len()));
+    let required = size.saturating_mul(2).saturating_add(64 * 1024 * 1024);
+    Ok(settings::available_space(parent)? >= required)
+}
+
+fn reclaim_step(connection: &Connection, database: &Path, control: &Arc<Control>) -> Result<bool> {
+    match index::reclaim_phase(connection)? {
+        index::ReclaimPhase::None => Ok(true),
+        index::ReclaimPhase::Vacuum => {
+            if !reclaim_space_available(database)? {
+                send_status("reclaim_wait_space", None);
+                return Ok(false);
+            }
+            send_status("reclaiming", index::stats(connection).ok());
+            let control = control.clone();
+            let finished = index::reclaim_vacuum(connection, move || {
+                control.stop.load(Ordering::Relaxed)
+                    || control.paused.load(Ordering::Relaxed)
+                    || control.resource_paused.load(Ordering::Relaxed)
+                    || control.searching.load(Ordering::Relaxed)
+            })?;
+            if finished && index::reclaim_checkpoint(connection)? {
+                send_status("reclaimed", None);
+                Ok(true)
+            } else {
+                send_status("reclaim_deferred", None);
+                Ok(false)
+            }
+        }
+        index::ReclaimPhase::Checkpoint => {
+            let finished = index::reclaim_checkpoint(connection)?;
+            if finished {
+                send_status("reclaimed", None);
+            } else {
+                send_status("reclaim_deferred", None);
+            }
+            Ok(finished)
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -305,6 +448,15 @@ fn main() -> Result<()> {
         std::thread::sleep(Duration::from_millis(25));
     }
     let mut connection = index::open(&db)?;
+    // The legacy table remains queryable during this restartable conversion.
+    // Reconciliation follows the conversion so no worker writes can race it.
+    let upgrade = upgrade_index(&mut connection, &db, &control)?;
+    match upgrade {
+        UpgradeOutcome::Stopped => return Ok(()),
+        UpgradeOutcome::LegacyFallback => send_status("optimization_fallback", None),
+        UpgradeOutcome::Upgraded => send_status("optimized", None),
+        UpgradeOutcome::Current => {}
+    }
     for excluded in &exclusions {
         remove_missing(&mut connection, excluded)?;
     }
@@ -326,6 +478,8 @@ fn main() -> Result<()> {
     let mut last_check = Instant::now();
     let mut pending_events: HashMap<PathBuf, Instant> = HashMap::new();
     let mut last_report = Instant::now() - Duration::from_secs(2);
+    let mut reclaim_pending = index::reclaim_phase(&connection)? != index::ReclaimPhase::None;
+    let mut reclaim_retry = Instant::now() + Duration::from_secs(10);
     loop {
         if control.stop.load(Ordering::Relaxed) {
             break;
@@ -373,6 +527,19 @@ fn main() -> Result<()> {
             }
             std::thread::sleep(Duration::from_millis(100));
             continue;
+        }
+        if reclaim_pending
+            && !control.searching.load(Ordering::Relaxed)
+            && Instant::now() >= reclaim_retry
+        {
+            match reclaim_step(&connection, &db, &control) {
+                Ok(true) => reclaim_pending = false,
+                Ok(false) => reclaim_retry = Instant::now() + Duration::from_secs(30),
+                Err(_) => {
+                    send_status("reclaim_failed", None);
+                    reclaim_retry = Instant::now() + Duration::from_secs(300);
+                }
+            }
         }
         if last_check.elapsed() >= Duration::from_secs(24 * 60 * 60) {
             control.rescan.store(true, Ordering::Relaxed);

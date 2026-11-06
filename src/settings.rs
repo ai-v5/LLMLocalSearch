@@ -76,7 +76,7 @@ fn move_new(from: &Path, to: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn available_space(path: &Path) -> Result<u64> {
+pub fn available_space(path: &Path) -> Result<u64> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -95,7 +95,7 @@ fn available_space(path: &Path) -> Result<u64> {
     Ok(available)
 }
 #[cfg(not(windows))]
-fn available_space(_path: &Path) -> Result<u64> {
+pub fn available_space(_path: &Path) -> Result<u64> {
     Ok(u64::MAX)
 }
 

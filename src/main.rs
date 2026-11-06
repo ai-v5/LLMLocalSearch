@@ -71,6 +71,8 @@ struct DeskApp {
     searching: bool,
     status: String,
     index_status: String,
+    legacy_warning: bool,
+    reclaim_warning: bool,
     paused: bool,
     show_settings: bool,
     first_close: bool,
@@ -172,6 +174,8 @@ impl DeskApp {
             searching: false,
             status: "输入关键词后开始搜索".into(),
             index_status: "正在启动索引…".into(),
+            legacy_warning: false,
+            reclaim_warning: false,
             paused: false,
             show_settings: false,
             first_close: false,
@@ -431,6 +435,15 @@ impl DeskApp {
         if let Some(worker) = &mut self.worker {
             while let Ok(message) = worker.messages.try_recv() {
                 if self.migrate_wait.is_none() && !self.migration_inflight {
+                    match message.get("state").and_then(|value| value.as_str()) {
+                        Some("optimization_fallback") => self.legacy_warning = true,
+                        Some("optimized") => self.legacy_warning = false,
+                        Some("reclaim_wait_space" | "reclaim_deferred" | "reclaim_failed") => {
+                            self.reclaim_warning = true
+                        }
+                        Some("reclaimed") => self.reclaim_warning = false,
+                        _ => {}
+                    }
                     if let (Some(files), Some(pending)) = (
                         message.get("files").and_then(|v| v.as_u64()),
                         message.get("pending").and_then(|v| v.as_u64()),
@@ -446,16 +459,30 @@ impl DeskApp {
                             .get("scan_errors")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0);
+                        let label = match state {
+                            "optimizing" => format!(
+                                "正在优化旧索引 {}/{}",
+                                message.get("copied").and_then(|v| v.as_u64()).unwrap_or(0),
+                                message.get("total").and_then(|v| v.as_u64()).unwrap_or(0)
+                            ),
+                            "reclaiming" => "正在整理索引空间".to_owned(),
+                            "paused" => "已暂停".to_owned(),
+                            "resource_paused" => "系统繁忙，已暂停".to_owned(),
+                            "scanning" => "扫描中".to_owned(),
+                            _ => "后台索引".to_owned(),
+                        };
                         self.index_status = format!(
-                            "{}：文件 {}，正文 {}，待处理 {}，解析异常 {}，云占位 {}，访问失败 {}",
-                            if state == "paused" {
-                                "已暂停"
-                            } else if state == "resource_paused" {
-                                "系统繁忙，已暂停"
-                            } else if state == "scanning" {
-                                "扫描中"
+                            "{}{}{}：文件 {}，正文 {}，待处理 {}，解析异常 {}，云占位 {}，访问失败 {}",
+                            label,
+                            if self.legacy_warning {
+                                "（优化未完成，使用旧索引）"
                             } else {
-                                "后台索引"
+                                ""
+                            },
+                            if self.reclaim_warning {
+                                "（空间整理待完成）"
+                            } else {
+                                ""
                             },
                             files,
                             indexed,
@@ -467,6 +494,23 @@ impl DeskApp {
                     } else if message.get("state").and_then(|v| v.as_str()) == Some("watch_failed")
                     {
                         self.index_status = "部分磁盘无法监听，将通过补扫更新".into();
+                    } else if message.get("state").and_then(|v| v.as_str())
+                        == Some("optimization_fallback")
+                    {
+                        self.index_status = "索引优化未完成，已保留旧索引继续运行".into();
+                    } else if message.get("state").and_then(|v| v.as_str())
+                        == Some("optimization_blocked")
+                    {
+                        self.index_status =
+                            "索引优化暂停；旧索引可搜索。请检查磁盘空间后选择恢复索引".into();
+                    } else if message.get("state").and_then(|v| v.as_str())
+                        == Some("reclaim_wait_space")
+                    {
+                        self.index_status = "索引已优化；可用空间不足，暂不整理磁盘占用".into();
+                    } else if message.get("state").and_then(|v| v.as_str())
+                        == Some("reclaim_failed")
+                    {
+                        self.index_status = "索引空间整理未完成，稍后重试".into();
                     }
                 }
             }
@@ -590,23 +634,16 @@ impl DeskApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
-}
 
-impl eframe::App for DeskApp {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll(ctx);
-    }
-
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        if ui.input(|i| i.viewport().close_requested()) {
+    fn handle_close_request(&mut self, ctx: &egui::Context, tray_available: bool) {
+        if ctx.input(|input| input.viewport().close_requested()) {
             let busy =
                 self.migrate_wait.is_some() || self.migration_inflight || self.cleanup_inflight;
-            if busy && (self.quit || self._tray.is_none()) {
+            if busy && (self.quit || !tray_available) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.quit = true;
                 self.status = "正在完成索引操作，然后退出…".into();
-            } else if !self.quit && self._tray.is_some() {
+            } else if !self.quit && tray_available {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 if self.settings.close_hint_seen {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -615,6 +652,19 @@ impl eframe::App for DeskApp {
                 }
             }
         }
+    }
+}
+
+impl eframe::App for DeskApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll(ctx);
+        // eframe can process a close request in a logic-only pass while hidden or
+        // minimized, so the close guard must not depend on a painted frame.
+        self.handle_close_request(ctx, self._tray.is_some());
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.heading("LLMLocalSearch");
@@ -1270,6 +1320,8 @@ mod tests {
             searching: false,
             status: String::new(),
             index_status: String::new(),
+            legacy_warning: false,
+            reclaim_warning: false,
             paused: false,
             show_settings: false,
             first_close: false,
@@ -1386,6 +1438,60 @@ mod tests {
     }
 
     #[test]
+    fn close_during_hidden_logic_defers_exit_until_migration_finishes() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let settings = Settings::default_for(temporary.path());
+        let mut app = app_for_test(temporary.path(), settings);
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let output = ctx.run_logic(&input, |ctx| eframe::App::logic(&mut app, ctx, &mut frame));
+        assert!(
+            output
+                .viewport_commands
+                .values()
+                .flatten()
+                .any(|command| { matches!(command, egui::ViewportCommand::CancelClose) })
+        );
+        assert!(app.quit);
+        Ok(())
+    }
+
+    #[test]
+    fn hidden_close_keeps_the_tray_process_alive() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let mut settings = Settings::default_for(temporary.path());
+        settings.close_hint_seen = true;
+        let mut app = app_for_test(temporary.path(), settings);
+        app.migration_inflight = false;
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        let viewport = input.viewports.entry(egui::ViewportId::ROOT).or_default();
+        viewport.minimized = Some(true);
+        viewport.events.push(egui::ViewportEvent::Close);
+        let output = ctx.run_logic(&input, |ctx| app.handle_close_request(ctx, true));
+        let commands: Vec<_> = output.viewport_commands.values().flatten().collect();
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, egui::ViewportCommand::CancelClose))
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, egui::ViewportCommand::Visible(false)))
+        );
+        assert!(!app.quit);
+        Ok(())
+    }
+
+    #[test]
     fn tray_events_restore_the_window_and_control_pausing() -> anyhow::Result<()> {
         let temporary = tempfile::tempdir()?;
         let settings = Settings::default_for(temporary.path());
@@ -1419,6 +1525,96 @@ mod tests {
     }
 
     #[test]
+    fn chinese_ime_commit_searches_at_multiple_dpi_scales() -> anyhow::Result<()> {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let temporary = tempfile::tempdir()?;
+            let settings = Settings::default_for(temporary.path());
+            std::fs::create_dir_all(&settings.index_dir)?;
+            let mut db = index::open(&settings.index_dir.join("index.db"))?;
+            let record = index::FileRecord {
+                path: "synthetic.txt".into(),
+                name: "合成文档.txt".into(),
+                kind: "txt".into(),
+                modified_ms: 1,
+                size: 1,
+                state: "pending".into(),
+            };
+            index::upsert_metadata(&mut db, &record)?;
+            index::set_body(
+                &mut db,
+                &record.path,
+                1,
+                1,
+                Some("前文中文检索后文"),
+                "indexed",
+            )?;
+            drop(db);
+
+            let mut app = app_for_test(temporary.path(), settings);
+            app.migration_inflight = false;
+            let ctx = egui::Context::default();
+            setup_fonts(&ctx);
+            let mut frame = eframe::Frame::_new_kittest();
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(650.0, 420.0),
+                )),
+                focused: true,
+                ..Default::default()
+            };
+            input
+                .viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default()
+                .native_pixels_per_point = Some(scale);
+            let mut warmup = ctx.run_ui(input.clone(), |ui| {
+                eframe::App::ui(&mut app, ui, &mut frame)
+            });
+            warmup.textures_delta.clear();
+            let field = egui::Id::new("search_input");
+            ctx.memory_mut(|memory| memory.request_focus(field));
+            let mut preedit = input.clone();
+            preedit
+                .events
+                .push(egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "zhongwen".into(),
+                    active_range_chars: Some(0..8),
+                }));
+            let mut composition =
+                ctx.run_ui(preedit, |ui| eframe::App::ui(&mut app, ui, &mut frame));
+            composition.textures_delta.clear();
+            let mut commit = input.clone();
+            commit
+                .events
+                .push(egui::Event::Ime(egui::ImeEvent::Commit("中文检索".into())));
+            let mut output = ctx.run_ui(commit, |ui| eframe::App::ui(&mut app, ui, &mut frame));
+            output.textures_delta.clear();
+            assert_eq!(app.query, "中文检索");
+            assert!((output.pixels_per_point - scale).abs() < 0.01);
+            let response = ctx.read_response(field).expect("search field rendered");
+            let bounds = input.screen_rect.expect("test bounds");
+            assert!(bounds.contains_rect(response.rect));
+            let _ = ctx.tessellate(output.shapes, output.pixels_per_point);
+
+            app.start_search(&ctx);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while app.searching && std::time::Instant::now() < deadline {
+                app.poll(&ctx);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(!app.searching);
+            assert_eq!(app.result.len(), 1);
+            let snippet = app.result[0].snippet.as_ref().expect("content snippet");
+            assert_eq!(
+                &snippet.text[snippet.hit_start..snippet.hit_end],
+                "中文检索"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "run during a synthetic indexing workload to measure egui CPU-side response"]
     fn input_to_egui_paint_baseline() -> anyhow::Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -1436,9 +1632,10 @@ mod tests {
             focused: true,
             ..Default::default()
         };
-        let warmup = ctx.run_ui(input.clone(), |ui| {
+        let mut warmup = ctx.run_ui(input.clone(), |ui| {
             eframe::App::ui(&mut app, ui, &mut frame)
         });
+        warmup.textures_delta.clear();
         let _ = ctx.tessellate(warmup.shapes, warmup.pixels_per_point);
         ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("search_input")));
         let mut durations = Vec::new();
@@ -1447,7 +1644,8 @@ mod tests {
             let mut event = input.clone();
             event.events.push(egui::Event::Text("测".into()));
             let started = std::time::Instant::now();
-            let output = ctx.run_ui(event, |ui| eframe::App::ui(&mut app, ui, &mut frame));
+            let mut output = ctx.run_ui(event, |ui| eframe::App::ui(&mut app, ui, &mut frame));
+            output.textures_delta.clear();
             let _ = ctx.tessellate(output.shapes, output.pixels_per_point);
             durations.push(started.elapsed().as_secs_f64() * 1000.0);
         }

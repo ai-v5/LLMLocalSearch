@@ -2,7 +2,7 @@ param(
     [Parameter(Mandatory=$true)][string]$TikaJar,
     [Parameter(Mandatory=$true)][string]$JavaZip,
     [Parameter(Mandatory=$true)][string]$MakeNsis,
-    [string]$OutputFile = 'dist\LLMLocalSearch-0.1.0-setup.exe'
+    [string]$OutputFile = 'dist\LLMLocalSearch-0.1.1-setup.exe'
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
