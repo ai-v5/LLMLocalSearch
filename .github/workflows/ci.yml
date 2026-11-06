@@ -38,7 +38,7 @@ jobs:
           New-Item -ItemType Directory -Path $downloads | Out-Null
           Invoke-WebRequest 'https://archive.apache.org/dist/tika/3.3.3/tika-app-3.3.3.jar' -OutFile (Join-Path $downloads 'tika.jar')
           Invoke-WebRequest 'https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.13%2B9/OpenJDK21U-jre_x64_windows_hotspot_21.0.13_9.zip' -OutFile (Join-Path $downloads 'jre.zip')
-          Invoke-WebRequest 'https://downloads.sourceforge.net/project/nsis/NSIS%203/3.11/nsis-3.11.zip' -OutFile (Join-Path $downloads 'nsis.zip')
+          Invoke-WebRequest 'https://distfiles.macports.org/nsis/nsis-3.11.zip' -OutFile (Join-Path $downloads 'nsis.zip')
           if ((Get-FileHash -LiteralPath (Join-Path $downloads 'nsis.zip') -Algorithm SHA256).Hash -ne 'C7D27F780DDB6CFFB4730138CD1591E841F4B7EDB155856901CDF5F214394FA1') { throw 'NSIS checksum mismatch' }
           Expand-Archive -LiteralPath (Join-Path $downloads 'nsis.zip') -DestinationPath $downloads
       - name: Build installer with verified dependencies
