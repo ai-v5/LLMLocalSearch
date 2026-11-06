@@ -548,15 +548,44 @@ fn main() -> Result<()> {
             && control.rescan.swap(false, Ordering::Relaxed)
         {
             send_status("scanning", index::stats(&connection).ok());
+            let mut last_scan_content = Instant::now() - Duration::from_secs(5);
+            let mut last_scan_report = Instant::now() - Duration::from_secs(5);
             for root in &roots {
                 if control.stop.load(Ordering::Relaxed) {
                     break;
                 }
-                scanner::scan_root(&mut connection, root, &exclusions, || {
-                    control.stop.load(Ordering::Relaxed)
-                        || control.paused.load(Ordering::Relaxed)
-                        || control.resource_paused.load(Ordering::Relaxed)
-                })?;
+                scanner::scan_root_with_progress(
+                    &mut connection,
+                    root,
+                    &exclusions,
+                    || {
+                        control.stop.load(Ordering::Relaxed)
+                            || control.paused.load(Ordering::Relaxed)
+                            || control.resource_paused.load(Ordering::Relaxed)
+                    },
+                    |connection| {
+                        if control.stop.load(Ordering::Relaxed)
+                            || control.paused.load(Ordering::Relaxed)
+                            || control.resource_paused.load(Ordering::Relaxed)
+                            || control.searching.load(Ordering::Relaxed)
+                        {
+                            return Ok(());
+                        }
+                        if last_scan_content.elapsed() >= Duration::from_secs(5) {
+                            if let Some(record) = pending(connection)?.into_iter().next()
+                                && let Some(update) = extract_one(connection, &runtime, record)?
+                            {
+                                flush_batch(connection, &mut vec![update])?;
+                            }
+                            last_scan_content = Instant::now();
+                        }
+                        if last_scan_report.elapsed() >= Duration::from_secs(5) {
+                            send_status("scanning", index::stats(connection).ok());
+                            last_scan_report = Instant::now();
+                        }
+                        Ok(())
+                    },
+                )?;
                 if control.paused.load(Ordering::Relaxed)
                     || control.resource_paused.load(Ordering::Relaxed)
                 {

@@ -49,6 +49,51 @@ fn state(db: &Path, name: &str) -> Option<String> {
 }
 
 #[test]
+fn first_content_is_indexed_before_all_roots_finish_scanning() -> Result<()> {
+    let temporary = tempdir()?;
+    let first = temporary.path().join("first");
+    let later = temporary.path().join("later");
+    let database = temporary.path().join("index.db");
+    std::fs::create_dir_all(&first)?;
+    std::fs::create_dir_all(&later)?;
+    std::fs::write(first.join("synthetic.txt"), "合成渐进正文")?;
+    const OTHER_FILES: usize = 1500;
+    for number in 0..OTHER_FILES {
+        std::fs::write(later.join(format!("synthetic-{number:04}.bin")), [])?;
+    }
+    let executable = Path::new(env!("CARGO_BIN_EXE_index-worker"));
+    let mut worker = worker_client::Worker::start(
+        executable.parent().expect("worker directory"),
+        &database,
+        &[first, later],
+        &[],
+        false,
+        false,
+        eframe::egui::Context::default(),
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while Instant::now() < deadline {
+        if !worker.running() {
+            bail!("synthetic worker exited while scanning");
+        }
+        if let Ok(connection) = index::open_reader(&database)
+            && let Ok(stats) = index::stats(&connection)
+            && stats.indexed > 0
+        {
+            assert!(
+                stats.files < (OTHER_FILES + 1) as u64,
+                "content stayed pending until all synthetic roots were scanned"
+            );
+            assert_eq!(count(&database, "合成渐进正文"), 1);
+            worker.stop();
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    bail!("synthetic content did not become searchable during scanning")
+}
+
+#[test]
 fn worker_observes_creation_modification_and_deletion() -> Result<()> {
     let temp = tempdir()?;
     let files = temp.path().join("files");
