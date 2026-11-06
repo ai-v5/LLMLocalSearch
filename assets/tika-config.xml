@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<properties>
+  <parsers>
+    <parser class="org.apache.tika.parser.html.JSoupParser"/>
+    <parser class="org.apache.tika.parser.microsoft.OfficeParser"/>
+    <parser class="org.apache.tika.parser.microsoft.ooxml.OOXMLParser"/>
+    <parser class="org.apache.tika.parser.pdf.PDFParser">
+      <params>
+        <param name="ocrStrategy" type="string">no_ocr</param>
+        <param name="extractInlineImages" type="bool">false</param>
+      </params>
+    </parser>
+  </parsers>
+</properties>

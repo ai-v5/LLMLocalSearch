@@ -1,0 +1,50 @@
+[package]
+name = "llmlocalsearch"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "AGPL-3.0-only"
+description = "Offline local file search for Windows"
+
+[[bin]]
+name = "llmlocalsearch"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[[bin]]
+name = "index-worker"
+path = "src/bin/index-worker.rs"
+
+[[bin]]
+name = "index-maintenance"
+path = "src/bin/index-maintenance.rs"
+
+[features]
+default = ["desktop"]
+desktop = ["dep:chrono", "dep:eframe", "dep:image", "dep:tray-icon"]
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"], optional = true }
+eframe = { version = "0.36.1", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"], optional = true }
+image = { version = "0.25.10", default-features = false, features = ["png", "ico"], optional = true }
+encoding_rs = "0.8.35"
+notify = { version = "8.2.0", default-features = false }
+rusqlite = { version = "0.40.2", features = ["bundled", "backup", "hooks"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tray-icon = { version = "0.19.3", optional = true }
+walkdir = "2.5.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59.0", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_SystemInformation", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[build-dependencies]
+cc = "1.11.1"
+
+[profile.release]
+lto = "thin"
+strip = true

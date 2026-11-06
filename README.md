@@ -1,2 +1,28 @@
 # LLMLocalSearch
-Offline local file search for Windows
+
+Windows 本地文件搜索工具。搜索文件名及支持格式的文档内容，按修改时间倒序显示结果和命中上下文。索引、文件及查询均保留在本机；程序不提供遥测或云端解析。
+
+## 功能
+
+- 默认索引当前用户可访问的本地固定磁盘；可排除目录、暂停与恢复。可移动磁盘和网络磁盘不自动扫描。
+- 所有文件类型可按文件名搜索；TXT、Markdown、HTML、DOC/DOCX、PPT/PPTX、XLS/XLSX 和含文本层的 PDF 可搜索内容。
+- 输入多个词时须全部命中，可用双引号括起连续短语。支持中文单字、双字及英文大小写不敏感搜索。
+- 文件变化通过监听及补扫更新；未下载的云占位文件不会被主动下载，权限不足、加密和解析失败等情况显示在索引状态中。
+- 索引默认保存在安装目录的 `Index` 子目录，可迁移至其他本地目录。索引包含提取的文档文字，请选择受控位置。
+- 关闭窗口后可通过系统托盘恢复或退出；开机启动默认关闭。
+
+OCR、图像中的文字、压缩包内容、宏执行、公式重算和语义搜索不在当前范围内。文件超过 64 MiB 或提取文本超过 8 MiB 时保留文件名索引，并显示解析限制。受保护或无法读取的文件不会被提升权限读取。
+
+## 开发与打包
+
+需要 Windows x64、Rust、Windows SDK 及 NSIS。运行 `cargo test --locked` 验证；测试只能使用合成数据。安装包通过 `scripts/package.ps1` 构建，该脚本要求传入 Tika 3.3.3 JAR、Temurin 21.0.13+9 Windows x64 JRE ZIP 和 `makensis.exe` 的路径，并检查解析组件哈希。具体第三方许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+```powershell
+.\scripts\package.ps1 -TikaJar C:\path\tika-app-3.3.3.jar -JavaZip C:\path\temurin-jre.zip -MakeNsis C:\path\makensis.exe
+```
+
+安装器允许选择安装目录，升级保留索引和设置；卸载默认保留索引，可显式选择删除当前索引。旧迁移副本需要在应用内单独确认清理。
+
+## 许可证
+
+本项目源代码采用 [AGPL-3.0-only](LICENSE)。随安装包分发的第三方组件保留各自的许可和声明。
