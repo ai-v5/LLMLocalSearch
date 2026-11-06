@@ -12,6 +12,7 @@ pub struct ScanStats {
     pub discovered: u64,
     pub changed: u64,
     pub inaccessible: u64,
+    pub root_unavailable: bool,
 }
 
 pub fn kind(path: &Path) -> &'static str {
@@ -159,6 +160,7 @@ pub fn scan_root_with_progress(
 ) -> Result<ScanStats> {
     let mut stats = ScanStats::default();
     if !root.is_dir() {
+        stats.root_unavailable = true;
         return Ok(stats);
     }
     let mut seen = HashSet::new();
@@ -188,6 +190,11 @@ pub fn scan_root_with_progress(
                         if let Some(path) = entry.path().to_str() {
                             issues.insert(path.to_owned());
                         }
+                        if !root.is_dir() {
+                            stats.root_unavailable = true;
+                            completed = false;
+                            break;
+                        }
                     }
                 }
             }
@@ -197,6 +204,11 @@ pub fn scan_root_with_progress(
                 if let Some(path) = error.path().and_then(|p| p.to_str()) {
                     issues.insert(path.to_owned());
                 }
+                if !root.is_dir() {
+                    stats.root_unavailable = true;
+                    completed = false;
+                    break;
+                }
             }
         }
         if stats.discovered > 0 {
@@ -205,7 +217,10 @@ pub fn scan_root_with_progress(
     }
     // A root can disappear after traversal starts. Never interpret that as
     // deletion of every file that the interrupted walk did not visit.
-    if completed && root.is_dir() {
+    if !root.is_dir() {
+        stats.root_unavailable = true;
+    }
+    if completed && !stats.root_unavailable {
         let previous_issues = {
             let mut stmt = connection.prepare("SELECT path FROM scan_issues")?;
             stmt.query_map([], |r| r.get::<_, String>(0))?
@@ -244,15 +259,22 @@ pub fn scan_root_with_progress(
                 continue;
             }
             if !root.is_dir() {
+                stats.root_unavailable = true;
                 break;
             }
             // Only a confirmed missing file on an online root is removed. Access denied is retained.
-            if fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-                && root.is_dir()
-            {
-                index::remove_path(connection, &path)?;
+            if fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+                if root.is_dir() {
+                    index::remove_path(connection, &path)?;
+                } else {
+                    stats.root_unavailable = true;
+                    break;
+                }
             }
         }
+    }
+    if !root.is_dir() {
+        stats.root_unavailable = true;
     }
     Ok(stats)
 }
@@ -311,7 +333,8 @@ mod tests {
         scan_root(&mut db, &root, std::slice::from_ref(&ignored), || false)?;
         assert_eq!(index::stats(&db)?.files, 1);
         fs::rename(&root, temp.path().join("offline"))?;
-        scan_root(&mut db, &root, &[], || false)?;
+        let offline_scan = scan_root(&mut db, &root, &[], || false)?;
+        assert!(offline_scan.root_unavailable);
         assert_eq!(index::stats(&db)?.files, 1);
         Ok(())
     }
@@ -329,7 +352,7 @@ mod tests {
         scan_root(&mut db, &root, &[], || false)?;
         assert_eq!(index::stats(&db)?.files, 20);
         let mut moved = false;
-        scan_root_with_progress(
+        let interrupted = scan_root_with_progress(
             &mut db,
             &root,
             &[],
@@ -343,7 +366,12 @@ mod tests {
             },
         )?;
         assert!(moved);
+        assert!(interrupted.root_unavailable);
         assert_eq!(index::stats(&db)?.files, 20, "offline files were removed");
+        fs::rename(&offline, &root)?;
+        let recovered = scan_root(&mut db, &root, &[], || false)?;
+        assert!(!recovered.root_unavailable);
+        assert_eq!(index::stats(&db)?.files, 20);
         Ok(())
     }
 }

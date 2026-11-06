@@ -94,6 +94,53 @@ fn first_content_is_indexed_before_all_roots_finish_scanning() -> Result<()> {
 }
 
 #[test]
+fn offline_root_recovers_and_reconciles_queued_changes() -> Result<()> {
+    let temporary = tempdir()?;
+    let root = temporary.path().join("files");
+    let offline = temporary.path().join("offline");
+    let database = temporary.path().join("index.db");
+    std::fs::create_dir(&root)?;
+    std::fs::write(root.join("old-name.txt"), "合成恢复内容")?;
+    let executable = Path::new(env!("CARGO_BIN_EXE_index-worker"));
+    let mut worker = worker_client::Worker::start(
+        executable.parent().expect("worker directory"),
+        &database,
+        std::slice::from_ref(&root),
+        &[],
+        false,
+        false,
+        eframe::egui::Context::default(),
+    )?;
+    wait_until("initial synthetic index", || {
+        count(&database, "old-name") == 1
+    })?;
+    worker.send("pause")?;
+    wait_until("synthetic worker paused", || {
+        worker
+            .messages
+            .try_iter()
+            .any(|message| message["state"] == "paused")
+    })?;
+    std::fs::rename(root.join("old-name.txt"), root.join("new-name.txt"))?;
+    std::fs::rename(&root, &offline)?;
+    while worker.messages.try_recv().is_ok() {}
+    worker.send("resume")?;
+    wait_until("offline synthetic root observed", || {
+        worker
+            .messages
+            .try_iter()
+            .any(|message| message["state"] == "running")
+    })?;
+    assert_eq!(count(&database, "old-name"), 1);
+    std::fs::rename(&offline, &root)?;
+    wait_until("recovered synthetic root reconciled", || {
+        count(&database, "new-name") == 1 && count(&database, "old-name") == 0
+    })?;
+    worker.stop();
+    Ok(())
+}
+
+#[test]
 fn worker_observes_creation_modification_and_deletion() -> Result<()> {
     let temp = tempdir()?;
     let files = temp.path().join("files");
