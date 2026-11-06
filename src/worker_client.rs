@@ -19,6 +19,7 @@ impl Worker {
         roots: &[PathBuf],
         exclusions: &[PathBuf],
         dynamic_fixed: bool,
+        paused: bool,
         wake: eframe::egui::Context,
     ) -> Result<Self> {
         let exe = exe_dir.join(if cfg!(windows) {
@@ -72,6 +73,9 @@ impl Worker {
             }
             wake.request_repaint();
         });
+        if paused {
+            writeln!(input, "pause")?;
+        }
         writeln!(input, "start")?;
         input.flush()?;
         Ok(Self {

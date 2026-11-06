@@ -1,5 +1,8 @@
 #![cfg(windows)]
 
+#[path = "../src/worker_client.rs"]
+mod worker_client;
+
 use anyhow::{Result, bail};
 use llmlocalsearch::{index, query::Scope};
 use std::io::Write;
@@ -136,4 +139,32 @@ fn automatically_retries_temporarily_locked_file() -> Result<()> {
         std::thread::sleep(Duration::from_millis(200));
     }
     bail!("previously locked file was not retried after reconciliation")
+}
+
+#[test]
+fn restarting_a_paused_worker_keeps_indexing_paused() -> Result<()> {
+    let temporary = tempdir()?;
+    let files = temporary.path().join("files");
+    let database = temporary.path().join("index.db");
+    std::fs::create_dir_all(&files)?;
+    std::fs::write(files.join("synthetic.txt"), "合成暂停测试")?;
+    let executable = Path::new(env!("CARGO_BIN_EXE_index-worker"));
+    let mut worker = worker_client::Worker::start(
+        executable.parent().expect("worker directory"),
+        &database,
+        &[files],
+        &[],
+        false,
+        true,
+        eframe::egui::Context::default(),
+    )?;
+    wait_until("worker database", || database.exists())?;
+    assert!(worker.running());
+    std::thread::sleep(Duration::from_secs(2));
+    let connection = index::open_reader(&database)?;
+    assert_eq!(index::stats(&connection)?.files, 0);
+    drop(connection);
+    let _ = worker.messages.try_recv();
+    worker.send("resume")?;
+    wait_until("resume", || count(&database, "合成暂停测试") == 1)
 }

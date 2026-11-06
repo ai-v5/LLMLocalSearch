@@ -41,6 +41,11 @@ struct SearchReply {
     event: SearchEvent,
 }
 
+struct MigrationOutcome {
+    index_dir: PathBuf,
+    previous_dir: Option<PathBuf>,
+}
+
 struct DeskApp {
     app_dir: PathBuf,
     settings_path: PathBuf,
@@ -78,8 +83,8 @@ struct DeskApp {
     cleanup_inflight: bool,
     cleanup_tx: mpsc::Sender<(PathBuf, Result<(), String>)>,
     cleanup_rx: mpsc::Receiver<(PathBuf, Result<(), String>)>,
-    migration_tx: mpsc::Sender<Result<Settings, String>>,
-    migration_rx: mpsc::Receiver<Result<Settings, String>>,
+    migration_tx: mpsc::Sender<Result<MigrationOutcome, String>>,
+    migration_rx: mpsc::Receiver<Result<MigrationOutcome, String>>,
     show_issues: bool,
     issues: Vec<(String, String)>,
     issue_tx: mpsc::Sender<Result<Vec<(String, String)>, String>>,
@@ -228,11 +233,17 @@ impl DeskApp {
             &roots,
             &exclusions,
             self.dynamic_fixed,
+            self.paused,
             ctx.clone(),
         ) {
             Ok(worker) => {
                 self.worker = Some(worker);
-                self.index_status = "后台索引已启动".into();
+                self.index_status = if self.paused {
+                    "后台索引已暂停"
+                } else {
+                    "后台索引已启动"
+                }
+                .into();
             }
             Err(e) => self.index_status = format!("后台索引未启动：{e}"),
         }
@@ -319,6 +330,10 @@ impl DeskApp {
         if self.migration_inflight || self.migrate_wait.is_some() {
             return;
         }
+        if self.cleanup_inflight {
+            self.status = "请等待旧索引清理完成后再迁移".into();
+            return;
+        }
         if !path.is_absolute() {
             self.status = "目标目录必须使用绝对路径".into();
             return;
@@ -329,6 +344,7 @@ impl DeskApp {
         }
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.searching = false;
+        self.cleanup_confirm = None;
         self.migrate_wait = Some(path);
         self.status = "正在停止索引以迁移…".into();
         if let Some(worker) = &mut self.worker {
@@ -381,7 +397,11 @@ impl DeskApp {
                 }
             } else if event == self.exit_id.0 {
                 self.quit = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                if self.migrate_wait.is_some() || self.migration_inflight || self.cleanup_inflight {
+                    self.status = "正在完成索引操作，然后退出…".into();
+                } else {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             }
         }
         while let Ok(reply) = self.search_rx.try_recv() {
@@ -476,8 +496,6 @@ impl DeskApp {
             let target = self.migrate_wait.take().expect("checked");
             let source = self.database();
             let previous_dir = self.settings.index_dir.clone();
-            let mut updated = self.settings.clone();
-            let settings_path = self.settings_path.clone();
             let tx = self.migration_tx.clone();
             let wake = ctx.clone();
             self.migration_inflight = true;
@@ -487,8 +505,10 @@ impl DeskApp {
                     let target = target.canonicalize()?;
                     if source.exists() {
                         let migrated = settings::migrate(&source, &target)?;
-                        updated.old_index_dirs.push(previous_dir);
-                        updated.index_dir = migrated.parent().expect("index parent").to_path_buf();
+                        Ok(MigrationOutcome {
+                            index_dir: migrated.parent().expect("index parent").to_path_buf(),
+                            previous_dir: Some(previous_dir),
+                        })
                     } else {
                         if !target.is_dir()
                             || target.join("index.db").exists()
@@ -503,10 +523,11 @@ impl DeskApp {
                             .open(&probe)?;
                         drop(f);
                         std::fs::remove_file(probe)?;
-                        updated.index_dir = target;
+                        Ok(MigrationOutcome {
+                            index_dir: target,
+                            previous_dir: None,
+                        })
                     }
-                    settings::save(&settings_path, &updated)?;
-                    Ok(updated)
                 })()
                 .map_err(|e| format!("迁移失败，原索引未删除：{e}"));
                 let _ = tx.send(result);
@@ -516,14 +537,30 @@ impl DeskApp {
         while let Ok(result) = self.migration_rx.try_recv() {
             self.migration_inflight = false;
             match result {
-                Ok(settings) => {
-                    self.settings = settings;
-                    self.migrate_path = self.settings.index_dir.to_string_lossy().into_owned();
-                    self.status = "索引迁移完成；原索引已保留".into();
+                Ok(outcome) => {
+                    let mut updated = self.settings.clone();
+                    if let Some(previous_dir) = outcome.previous_dir
+                        && !updated.old_index_dirs.contains(&previous_dir)
+                    {
+                        updated.old_index_dirs.push(previous_dir);
+                    }
+                    updated.index_dir = outcome.index_dir;
+                    match settings::save(&self.settings_path, &updated) {
+                        Ok(()) => {
+                            self.settings = updated;
+                            self.migrate_path =
+                                self.settings.index_dir.to_string_lossy().into_owned();
+                            self.status = "索引迁移完成；原索引已保留".into();
+                        }
+                        Err(_) => self.status = "迁移设置保存失败，仍使用原索引".into(),
+                    }
                 }
                 Err(error) => self.status = error,
             }
-            self.start_worker(ctx);
+            self.restart_requested = false;
+            if !self.quit {
+                self.start_worker(ctx);
+            }
         }
         while let Ok((path, result)) = self.cleanup_rx.try_recv() {
             self.cleanup_inflight = false;
@@ -545,6 +582,13 @@ impl DeskApp {
                 Err(e) => self.status = e,
             }
         }
+        if self.quit
+            && self.migrate_wait.is_none()
+            && !self.migration_inflight
+            && !self.cleanup_inflight
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     }
 }
 
@@ -555,12 +599,20 @@ impl eframe::App for DeskApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        if ui.input(|i| i.viewport().close_requested()) && !self.quit && self._tray.is_some() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            if self.settings.close_hint_seen {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            } else {
-                self.first_close = true;
+        if ui.input(|i| i.viewport().close_requested()) {
+            let busy =
+                self.migrate_wait.is_some() || self.migration_inflight || self.cleanup_inflight;
+            if busy && (self.quit || self._tray.is_none()) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.quit = true;
+                self.status = "正在完成索引操作，然后退出…".into();
+            } else if !self.quit && self._tray.is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                if self.settings.close_hint_seen {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                } else {
+                    self.first_close = true;
+                }
             }
         }
         ui.add_space(8.0);
@@ -579,7 +631,9 @@ impl eframe::App for DeskApp {
         ui.horizontal(|ui| {
             let input = ui.add_sized(
                 [ui.available_width().max(160.0) - 85.0, 32.0],
-                egui::TextEdit::singleline(&mut self.query).hint_text("输入文件名或内容关键词"),
+                egui::TextEdit::singleline(&mut self.query)
+                    .id(egui::Id::new("search_input"))
+                    .hint_text("输入文件名或内容关键词"),
             );
             if ui.button("搜索").clicked()
                 || (input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
@@ -749,7 +803,15 @@ impl eframe::App for DeskApp {
                 for path in &self.settings.old_index_dirs {
                     ui.horizontal(|ui| {
                         ui.label(format!("旧索引：{}", path.display()));
-                        if ui.small_button("清理旧副本").clicked() && !self.cleanup_inflight {
+                        if ui
+                            .add_enabled(
+                                !self.cleanup_inflight
+                                    && self.migrate_wait.is_none()
+                                    && !self.migration_inflight,
+                                egui::Button::new("清理旧副本").small(),
+                            )
+                            .clicked()
+                        {
                             cleanup = Some(path.clone());
                         }
                     });
@@ -812,7 +874,10 @@ impl eframe::App for DeskApp {
             if let Some(path) = migrate {
                 self.begin_migration(path);
             }
-            if let Some(path) = cleanup {
+            if let Some(path) = cleanup
+                && self.migrate_wait.is_none()
+                && !self.migration_inflight
+            {
                 self.cleanup_confirm = Some(path);
             }
             if let Some(path) = add_root {
@@ -1168,3 +1233,197 @@ fn show_error(message: &str) {
 }
 #[cfg(not(windows))]
 fn show_error(_message: &str) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app_for_test(directory: &Path, settings: Settings) -> DeskApp {
+        let (_, tray_events) = mpsc::channel();
+        let (search_tx, search_rx) = mpsc::channel();
+        let (migration_tx, migration_rx) = mpsc::channel();
+        let (cleanup_tx, cleanup_rx) = mpsc::channel();
+        let (issue_tx, issue_rx) = mpsc::channel();
+        DeskApp {
+            app_dir: directory.to_path_buf(),
+            settings_path: directory.join("settings.json"),
+            migrate_path: String::new(),
+            settings,
+            roots: Vec::new(),
+            dynamic_fixed: false,
+            worker: None,
+            _tray: None,
+            tray_events,
+            open_id: MenuId::new("open"),
+            pause_id: MenuId::new("pause"),
+            resume_id: MenuId::new("resume"),
+            exit_id: MenuId::new("exit"),
+            query: String::new(),
+            scope: Scope::Both,
+            kinds: [true; 8],
+            result: Vec::new(),
+            page: 0,
+            generation: Arc::new(AtomicU64::new(0)),
+            active_searches: Arc::new(AtomicUsize::new(0)),
+            search_tx,
+            search_rx,
+            searching: false,
+            status: String::new(),
+            index_status: String::new(),
+            paused: false,
+            show_settings: false,
+            first_close: false,
+            quit: false,
+            migrate_wait: None,
+            migration_inflight: true,
+            restart_requested: false,
+            cleanup_confirm: None,
+            cleanup_inflight: false,
+            cleanup_tx,
+            cleanup_rx,
+            migration_tx,
+            migration_rx,
+            show_issues: false,
+            issues: Vec::new(),
+            issue_tx,
+            issue_rx,
+        }
+    }
+
+    #[test]
+    fn migration_preserves_settings_saved_while_it_was_running() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let source = temporary.path().join("source");
+        let target = temporary.path().join("target");
+        std::fs::create_dir_all(&source)?;
+        std::fs::create_dir_all(&target)?;
+        let mut latest = Settings::default_for(temporary.path());
+        latest.index_dir = source.clone();
+        latest.exclusions.push(temporary.path().join("excluded"));
+        latest.close_hint_seen = true;
+        let mut app = app_for_test(temporary.path(), latest.clone());
+        settings::save(&app.settings_path, &latest)?;
+        app.migration_tx.send(Ok(MigrationOutcome {
+            index_dir: target.clone(),
+            previous_dir: Some(source.clone()),
+        }))?;
+        app.poll(&egui::Context::default());
+        assert_eq!(app.settings.index_dir, target);
+        assert_eq!(app.settings.old_index_dirs, vec![source]);
+        assert_eq!(app.settings.exclusions, latest.exclusions);
+        assert!(app.settings.close_hint_seen);
+        let stored = settings::load(&app.settings_path, temporary.path())?;
+        assert_eq!(stored.exclusions, latest.exclusions);
+        assert!(stored.close_hint_seen);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_migration_settings_save_keeps_the_original_index() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let source = temporary.path().join("source");
+        let target = temporary.path().join("target");
+        std::fs::create_dir_all(&source)?;
+        std::fs::create_dir_all(&target)?;
+        let mut latest = Settings::default_for(temporary.path());
+        latest.index_dir = source.clone();
+        let mut app = app_for_test(temporary.path(), latest.clone());
+        settings::save(&app.settings_path, &latest)?;
+        std::fs::write(app.settings_path.with_extension("tmp"), "occupied")?;
+        app.migration_tx.send(Ok(MigrationOutcome {
+            index_dir: target,
+            previous_dir: Some(source.clone()),
+        }))?;
+        app.poll(&egui::Context::default());
+        assert_eq!(app.settings.index_dir, source);
+        assert_eq!(
+            settings::load(&app.settings_path, temporary.path())?.index_dir,
+            source
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exit_waits_until_migration_commits() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let source = temporary.path().join("source");
+        let target = temporary.path().join("target");
+        std::fs::create_dir_all(&source)?;
+        std::fs::create_dir_all(&target)?;
+        let mut latest = Settings::default_for(temporary.path());
+        latest.index_dir = source.clone();
+        let mut app = app_for_test(temporary.path(), latest);
+        let (tray_tx, tray_rx) = mpsc::channel();
+        app.tray_events = tray_rx;
+        tray_tx.send(app.exit_id.0.clone())?;
+        let ctx = egui::Context::default();
+        let first = ctx.run_logic(&egui::RawInput::default(), |ctx| app.poll(ctx));
+        assert!(app.quit && app.migration_inflight);
+        assert!(
+            !first
+                .viewport_commands
+                .values()
+                .flatten()
+                .any(|c| matches!(c, egui::ViewportCommand::Close))
+        );
+        app.migration_tx.send(Ok(MigrationOutcome {
+            index_dir: target.clone(),
+            previous_dir: Some(source),
+        }))?;
+        let second = ctx.run_logic(&egui::RawInput::default(), |ctx| app.poll(ctx));
+        assert!(
+            second
+                .viewport_commands
+                .values()
+                .flatten()
+                .any(|c| matches!(c, egui::ViewportCommand::Close))
+        );
+        assert_eq!(
+            settings::load(&app.settings_path, temporary.path())?.index_dir,
+            target
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "run during a synthetic indexing workload to measure egui CPU-side response"]
+    fn input_to_egui_paint_baseline() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let settings = Settings::default_for(temporary.path());
+        let mut app = app_for_test(temporary.path(), settings);
+        app.migration_inflight = false;
+        let ctx = egui::Context::default();
+        setup_fonts(&ctx);
+        let mut frame = eframe::Frame::_new_kittest();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(980.0, 720.0),
+            )),
+            focused: true,
+            ..Default::default()
+        };
+        let warmup = ctx.run_ui(input.clone(), |ui| {
+            eframe::App::ui(&mut app, ui, &mut frame)
+        });
+        let _ = ctx.tessellate(warmup.shapes, warmup.pixels_per_point);
+        ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("search_input")));
+        let mut durations = Vec::new();
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let mut event = input.clone();
+            event.events.push(egui::Event::Text("测".into()));
+            let started = std::time::Instant::now();
+            let output = ctx.run_ui(event, |ui| eframe::App::ui(&mut app, ui, &mut frame));
+            let _ = ctx.tessellate(output.shapes, output.pixels_per_point);
+            durations.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        assert_eq!(app.query.chars().count(), 100);
+        durations.sort_by(f64::total_cmp);
+        println!(
+            "synthetic egui text event to tessellation p95_ms={:.3} samples=100",
+            durations[94]
+        );
+        Ok(())
+    }
+}
