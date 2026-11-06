@@ -168,3 +168,65 @@ fn restarting_a_paused_worker_keeps_indexing_paused() -> Result<()> {
     worker.send("resume")?;
     wait_until("resume", || count(&database, "合成暂停测试") == 1)
 }
+
+#[test]
+fn detects_directory_moves_and_changes_while_stopped() -> Result<()> {
+    let temporary = tempdir()?;
+    let root = temporary.path().join("files");
+    let before = root.join("before");
+    let after = root.join("after");
+    let database = temporary.path().join("index.db");
+    std::fs::create_dir_all(&before)?;
+    for number in 0..40 {
+        std::fs::write(
+            before.join(format!("synthetic-{number:02}.txt")),
+            "批量合成标记",
+        )?;
+    }
+    let executable = Path::new(env!("CARGO_BIN_EXE_index-worker"));
+    let start = || {
+        worker_client::Worker::start(
+            executable.parent().expect("worker directory"),
+            &database,
+            std::slice::from_ref(&root),
+            &[],
+            false,
+            false,
+            eframe::egui::Context::default(),
+        )
+    };
+    let mut worker = start()?;
+    wait_until("initial batch", || count(&database, "批量合成标记") == 40)?;
+    std::fs::rename(&before, &after)?;
+    wait_until("directory move", || {
+        index::open_reader(&database)
+            .and_then(|connection| {
+                index::search(&connection, "批量合成标记", Scope::Both, &[], &[], || false)
+            })
+            .is_ok_and(|hits| {
+                hits.len() == 40
+                    && hits
+                        .iter()
+                        .all(|hit| Path::new(&hit.file.path).starts_with(&after))
+            })
+    })?;
+    for number in 0..20 {
+        std::fs::write(
+            after.join(format!("added-{number:02}.txt")),
+            "批量新增合成标记",
+        )?;
+    }
+    wait_until("batch create", || {
+        count(&database, "批量新增合成标记") == 20
+    })?;
+    worker.stop();
+    drop(worker);
+    std::fs::write(after.join("offline.txt"), "离线新增合成标记")?;
+    let mut worker = start()?;
+    wait_until("change while stopped", || {
+        count(&database, "离线新增合成标记") == 1
+    })?;
+    let _ = worker.messages.try_recv();
+    worker.stop();
+    Ok(())
+}
