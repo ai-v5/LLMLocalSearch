@@ -20,6 +20,7 @@ struct Usage {
     index_bytes: u64,
     other_bytes: u64,
     has_database: bool,
+    database_unknown: bool,
     complete: bool,
 }
 
@@ -100,6 +101,8 @@ impl StorageMonitor {
             Some(Ok(usage)) => {
                 let index = if usage.has_database {
                     format!("约 {}", format_size(usage.index_bytes))
+                } else if usage.database_unknown {
+                    "暂时无法读取".to_owned()
                 } else if usage.index_bytes > 0 {
                     format!("未创建（残留文件约 {}）", format_size(usage.index_bytes))
                 } else {
@@ -141,9 +144,15 @@ fn measure(directory: &Path, limit: usize, budget: Duration) -> io::Result<Usage
                 usage.index_bytes = usage.index_bytes.saturating_add(bytes);
                 usage.complete &= accurate;
             }
-            Ok(_) => usage.complete = false,
+            Ok(_) => {
+                usage.complete = false;
+                usage.database_unknown |= name == "index.db";
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(_) => usage.complete = false,
+            Err(_) => {
+                usage.complete = false;
+                usage.database_unknown |= name == "index.db";
+            }
         }
     }
 
@@ -313,6 +322,19 @@ mod tests {
         assert_eq!(usage.index_bytes, 4096);
         assert!(usage.has_database);
         assert!(!usage.complete);
+        Ok(())
+    }
+
+    #[test]
+    fn inaccessible_index_is_not_reported_as_missing() -> io::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        fs::create_dir(temporary.path().join("index.db"))?;
+        let usage = measure(temporary.path(), 100, Duration::from_secs(10))?;
+        assert!(!usage.has_database && usage.database_unknown && !usage.complete);
+        let mut monitor = StorageMonitor::new();
+        monitor.usage = Some(Ok(usage));
+        assert!(monitor.label().contains("暂时无法读取"));
+        assert!(!monitor.label().contains("未创建"));
         Ok(())
     }
 
