@@ -157,6 +157,80 @@ fn upgrade_index(
     }
 }
 
+fn apply_content_scope(connection: &mut Connection, control: &Arc<Control>) -> Result<bool> {
+    let mut last_report = Instant::now() - Duration::from_secs(2);
+    let mut processed = 0;
+    loop {
+        if control.stop.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        let paused = control.paused.load(Ordering::Relaxed);
+        let busy = control.resource_paused.load(Ordering::Relaxed);
+        let searching = control.searching.load(Ordering::Relaxed);
+        if paused || busy || searching {
+            if last_report.elapsed() >= Duration::from_secs(1) {
+                send_content_scope_status(
+                    if paused {
+                        "content_scope_paused"
+                    } else if busy {
+                        "content_scope_resource_paused"
+                    } else {
+                        "content_scope"
+                    },
+                    processed,
+                );
+                last_report = Instant::now();
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        if last_report.elapsed() >= Duration::from_secs(1) {
+            send_content_scope_status("content_scope", processed);
+            last_report = Instant::now();
+        }
+        let interrupt = control.clone();
+        let step = index::interruptible_content_scope_step(connection, 128, move || {
+            interrupt.stop.load(Ordering::Relaxed)
+                || interrupt.paused.load(Ordering::Relaxed)
+                || interrupt.resource_paused.load(Ordering::Relaxed)
+                || interrupt.searching.load(Ordering::Relaxed)
+        });
+        match step {
+            Ok(index::ContentScopeStep::Current) => {
+                send_content_scope_status("content_scope_complete", processed);
+                return Ok(true);
+            }
+            Ok(index::ContentScopeStep::Finished { processed }) => {
+                send_content_scope_status("content_scope_complete", processed);
+                return Ok(true);
+            }
+            Ok(index::ContentScopeStep::Working { processed: value }) => processed = value,
+            Err(error)
+                if error.downcast_ref::<rusqlite::Error>().is_some_and(|e| {
+                    matches!(e, rusqlite::Error::SqliteFailure(code, _)
+                    if code.code == rusqlite::ErrorCode::OperationInterrupted)
+                }) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+        if last_report.elapsed() >= Duration::from_secs(1) {
+            send_content_scope_status("content_scope", processed);
+            last_report = Instant::now();
+        }
+    }
+}
+
+fn send_content_scope_status(state: &str, processed: u64) {
+    let mut output = std::io::stdout().lock();
+    let _ = writeln!(
+        output,
+        "{}",
+        serde_json::json!({"state":state,"processed":processed})
+    );
+}
+
 fn reclaim_space_available(database: &Path) -> Result<bool> {
     let parent = database.parent().context("索引目录无效")?;
     let mut wal_name = database.as_os_str().to_os_string();
@@ -279,7 +353,7 @@ fn file_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<index::FileRecord> {
 
 fn pending(connection: &Connection) -> Result<Vec<index::FileRecord>> {
     let ready = {
-        let mut statement = connection.prepare("SELECT path,name,kind,modified_ms,size,state FROM files WHERE state='pending' ORDER BY modified_ms DESC,id LIMIT 10")?;
+        let mut statement = connection.prepare("SELECT path,name,kind,modified_ms,size,state FROM files WHERE state='pending' AND kind IN ('markdown','word','powerpoint','excel') ORDER BY modified_ms DESC,id LIMIT 10")?;
         statement
             .query_map([], file_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?
@@ -292,7 +366,7 @@ fn pending(connection: &Connection) -> Result<Vec<index::FileRecord>> {
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64;
-    let mut statement = connection.prepare("SELECT files.path,files.name,files.kind,files.modified_ms,files.size,files.state FROM retries JOIN files ON files.id=retries.file_id WHERE retries.next_ms<=?1 ORDER BY retries.next_ms LIMIT 10")?;
+    let mut statement = connection.prepare("SELECT files.path,files.name,files.kind,files.modified_ms,files.size,files.state FROM retries JOIN files ON files.id=retries.file_id WHERE retries.next_ms<=?1 AND files.kind IN ('markdown','word','powerpoint','excel') ORDER BY retries.next_ms LIMIT 10")?;
     let rows = statement
         .query_map([now], file_row)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -320,7 +394,7 @@ fn extract_one(
     record: index::FileRecord,
 ) -> Result<Option<index::BodyUpdate>> {
     let path = Path::new(&record.path);
-    let outcome = if record.kind == "txt" || record.kind == "markdown" {
+    let outcome = if record.kind == "markdown" {
         text::read_plain(path)
     } else {
         tika::extract(runtime, path)
@@ -517,6 +591,9 @@ fn main() -> Result<()> {
         UpgradeOutcome::LegacyFallback => send_status("optimization_fallback", None),
         UpgradeOutcome::Upgraded => send_status("optimized", None),
         UpgradeOutcome::Current => {}
+    }
+    if !apply_content_scope(&mut connection, &control)? {
+        return Ok(());
     }
     for excluded in &exclusions {
         remove_missing(&mut connection, excluded)?;
@@ -766,6 +843,81 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn pending_legacy_text_is_not_dispatched() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut db = index::open(&temp.path().join("index.db"))?;
+        for (path, kind, modified_ms) in [("old.txt", "txt", 2), ("new.md", "markdown", 1)] {
+            index::upsert_metadata(
+                &mut db,
+                &index::FileRecord {
+                    path: path.into(),
+                    name: path.into(),
+                    kind: kind.into(),
+                    modified_ms,
+                    size: 1,
+                    state: "pending".into(),
+                },
+            )?;
+        }
+        let selected = pending(&db)?;
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].kind, "markdown");
+        Ok(())
+    }
+
+    #[test]
+    fn content_scope_waits_for_pause_and_search_then_resumes() -> Result<()> {
+        use std::sync::mpsc::RecvTimeoutError;
+        let temporary = tempfile::tempdir()?;
+        let database = temporary.path().join("index.db");
+        let mut db = index::open(&database)?;
+        index::upsert_metadata(
+            &mut db,
+            &index::FileRecord {
+                path: "legacy.txt".into(),
+                name: "legacy.txt".into(),
+                kind: "txt".into(),
+                modified_ms: 1,
+                size: 1,
+                state: "pending".into(),
+            },
+        )?;
+        drop(db);
+        let control = Arc::new(Control::default());
+        control.paused.store(true, Ordering::Relaxed);
+        control.searching.store(true, Ordering::Relaxed);
+        let shared = control.clone();
+        let (sender, receiver) = mpsc::channel();
+        let worker_database = database.clone();
+        let thread = std::thread::spawn(move || {
+            let result = index::open(&worker_database)
+                .and_then(|mut db| apply_content_scope(&mut db, &shared));
+            let _ = sender.send(result);
+        });
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(250)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        control.paused.store(false, Ordering::Relaxed);
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(250)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        control.searching.store(false, Ordering::Relaxed);
+        assert!(receiver.recv_timeout(Duration::from_secs(10))??);
+        thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("scope thread panicked"))?;
+        let db = index::open_reader(&database)?;
+        assert_eq!(
+            db.query_row("SELECT state FROM files WHERE path='legacy.txt'", [], |r| r
+                .get::<_, String>(0))?,
+            "name_only"
+        );
+        Ok(())
+    }
+
     // Run separately from the regular suite: it creates a large synthetic database.
     #[cfg(windows)]
     #[test]
@@ -808,6 +960,37 @@ mod tests {
                 let mut connection = Connection::open(database)?;
                 remove_missing(&mut connection, &root.join("excluded"))?;
                 eprintln!("synthetic startup cleanup completed");
+                assert!(apply_content_scope(
+                    &mut connection,
+                    &Arc::new(Control::default())
+                )?);
+                assert_eq!(connection.query_row(
+                    "SELECT count(*) FROM files WHERE kind='txt' AND (state!='name_only' OR body IS NOT NULL)",
+                    [], |row| row.get::<_, i64>(0))?, 0);
+                let name_expression = llmlocalsearch::query::fts_expression(
+                    &llmlocalsearch::query::parse("synthetic-00000000.txt"),
+                    llmlocalsearch::query::Scope::Name,
+                );
+                assert_eq!(
+                    connection.query_row(
+                        "SELECT count(*) FROM terms JOIN files ON files.id=terms.rowid WHERE terms MATCH ?1 AND files.name=?2",
+                        rusqlite::params![name_expression, "synthetic-00000000.txt"],
+                        |row| row.get::<_, i64>(0)
+                    )?,
+                    1
+                );
+                let body_expression = llmlocalsearch::query::fts_expression(
+                    &llmlocalsearch::query::parse("旧版合成正文"),
+                    llmlocalsearch::query::Scope::Content,
+                );
+                assert_eq!(
+                    connection.query_row(
+                        "SELECT count(*) FROM terms WHERE terms MATCH ?1",
+                        [body_expression],
+                        |row| row.get::<_, i64>(0)
+                    )?,
+                    0
+                );
                 scanner::scan_root(&mut connection, &root, &[], || false)?;
                 assert_eq!(seen.len(), count);
                 let mut peak: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
@@ -837,8 +1020,12 @@ mod tests {
         let mut connection = Connection::open(&database)?;
         connection.execute_batch(
             "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;
-             CREATE TABLE files(id INTEGER PRIMARY KEY,path TEXT NOT NULL);
-             CREATE TABLE scan_issues(path TEXT PRIMARY KEY,category TEXT NOT NULL);",
+             CREATE TABLE files(id INTEGER PRIMARY KEY,path TEXT NOT NULL,name TEXT NOT NULL,
+                 kind TEXT NOT NULL,state TEXT NOT NULL,body TEXT);
+             CREATE TABLE scan_issues(path TEXT PRIMARY KEY,category TEXT NOT NULL);
+             CREATE TABLE retries(file_id INTEGER PRIMARY KEY,attempts INTEGER NOT NULL,next_ms INTEGER NOT NULL);
+             CREATE VIRTUAL TABLE terms USING fts5(name_grams,body_grams,
+                 tokenize='ascii',content='',contentless_delete=1,detail=column);",
         )?;
         let count = std::env::var("LLMLOCAL_TEST_PATH_COUNT")
             .ok()
@@ -852,10 +1039,36 @@ mod tests {
         );
         let tx = connection.transaction()?;
         {
-            let mut statement = tx.prepare("INSERT INTO files(path) VALUES(?1)")?;
+            let mut statement =
+                tx.prepare("INSERT INTO files(path,name,kind,state,body) VALUES(?1,?2,?3,?4,?5)")?;
+            let mut terms =
+                tx.prepare("INSERT INTO terms(rowid,name_grams,body_grams) VALUES(?1,?2,?3)")?;
             for number in 0..count {
                 let path = format!(r"S:\synthetic-outside\{number:08}\{padding}.txt");
-                statement.execute([path])?;
+                let indexed = number % 30_000 == 0;
+                let excluded = number % 75 == 0;
+                let name = if indexed {
+                    format!("synthetic-{number:08}.txt")
+                } else {
+                    "synthetic.bin".into()
+                };
+                let kind = if excluded { "txt" } else { "other" };
+                let state = if indexed {
+                    "indexed"
+                } else if excluded {
+                    "pending"
+                } else {
+                    "name_only"
+                };
+                let body = indexed.then_some("旧版合成正文");
+                statement.execute(rusqlite::params![path, name, kind, state, body])?;
+                if indexed {
+                    terms.execute(rusqlite::params![
+                        number as i64 + 1,
+                        llmlocalsearch::query::grams(&name),
+                        llmlocalsearch::query::grams("旧版合成正文")
+                    ])?;
+                }
             }
         }
         tx.commit()?;

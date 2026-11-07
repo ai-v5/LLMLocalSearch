@@ -40,7 +40,7 @@ for i in range(100_000):
     # Do not split a UTF-8 sequence at the fixed byte boundary.
     text = repeated.decode("utf-8", errors="ignore").encode("utf-8")
     data = header + text + b" " * (size - len(header) - len(text))
-    (folder / f"document-{i:06d}.txt").write_bytes(data)
+    (folder / f"document-{i:06d}.md").write_bytes(data)
     if (i + 1) % 10_000 == 0:
         print(f"generated={i + 1} bytes={(i + 1) * size} elapsed={time.monotonic() - start:.1f}s", flush=True)
 with manifest.open("x", encoding="utf-8") as output:
