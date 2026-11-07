@@ -78,29 +78,46 @@ pub enum Scope {
     Content,
 }
 
+fn fts_term_expression(term: &str, scope: Scope) -> String {
+    let tokens = term_grams(term).join(" AND ");
+    match scope {
+        Scope::Both => format!("(name_grams:({tokens}) OR body_grams:({tokens}))"),
+        Scope::Name => format!("name_grams:({tokens})"),
+        Scope::Content => format!("body_grams:({tokens})"),
+    }
+}
+
 pub fn fts_expression(terms: &[String], scope: Scope) -> String {
     terms
         .iter()
-        .map(|term| {
-            let tokens = term_grams(term).join(" AND ");
-            match scope {
-                Scope::Both => format!("(name_grams:({tokens}) OR body_grams:({tokens}))"),
-                Scope::Name => format!("name_grams:({tokens})"),
-                Scope::Content => format!("body_grams:({tokens})"),
-            }
-        })
+        .map(|term| fts_term_expression(term, scope))
         .collect::<Vec<_>>()
         .join(" AND ")
 }
 
-pub fn matches(terms: &[String], name: &str, body: &str, scope: Scope) -> bool {
+pub fn fts_any_expression(terms: &[String], scope: Scope) -> String {
+    terms
+        .iter()
+        .map(|term| fts_term_expression(term, scope))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+pub fn matched_terms(terms: &[String], name: &str, body: &str, scope: Scope) -> usize {
     let name = normalize(name);
     let body = normalize(body);
-    terms.iter().all(|term| match scope {
-        Scope::Both => name.contains(term) || body.contains(term),
-        Scope::Name => name.contains(term),
-        Scope::Content => body.contains(term),
-    })
+    terms
+        .iter()
+        .filter(|term| match scope {
+            Scope::Both => name.contains(term.as_str()) || body.contains(term.as_str()),
+            Scope::Name => name.contains(term.as_str()),
+            Scope::Content => body.contains(term.as_str()),
+        })
+        .count()
+}
+
+pub fn matches(terms: &[String], name: &str, body: &str, scope: Scope) -> bool {
+    matched_terms(terms, name, body, scope) == terms.len()
 }
 
 #[cfg(test)]

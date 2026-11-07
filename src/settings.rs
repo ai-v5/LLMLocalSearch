@@ -6,6 +6,15 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemePreference {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
     pub index_dir: PathBuf,
@@ -19,6 +28,8 @@ pub struct Settings {
     pub autostart: bool,
     #[serde(default)]
     pub old_index_dirs: Vec<PathBuf>,
+    #[serde(default)]
+    pub theme: ThemePreference,
 }
 
 impl Settings {
@@ -30,6 +41,7 @@ impl Settings {
             close_hint_seen: false,
             autostart: false,
             old_index_dirs: Vec::new(),
+            theme: ThemePreference::System,
         }
     }
 }
@@ -215,6 +227,36 @@ mod tests {
         assert!(src.exists() && output.exists());
         assert!(migrate(&src, &target).is_err());
         assert!(src.exists() && output.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_settings_default_to_system_theme_and_preserve_other_values() -> Result<()> {
+        let temp = tempdir()?;
+        let file = temp.path().join("settings.json");
+        let original_index = temp.path().join("old-index");
+        let original_exclusion = temp.path().join("excluded");
+        fs::write(
+            &file,
+            serde_json::to_vec(&serde_json::json!({
+                "index_dir": original_index,
+                "exclusions": [original_exclusion],
+                "autostart": true,
+                "close_hint_seen": true
+            }))?,
+        )?;
+        let mut settings = load(&file, temp.path())?;
+        assert_eq!(settings.theme, ThemePreference::System);
+        assert_eq!(settings.index_dir, original_index);
+        assert_eq!(settings.exclusions, vec![original_exclusion]);
+        assert!(settings.autostart && settings.close_hint_seen);
+        settings.theme = ThemePreference::Dark;
+        save(&file, &settings)?;
+        let stored = load(&file, temp.path())?;
+        assert_eq!(stored.theme, ThemePreference::Dark);
+        assert_eq!(stored.index_dir, original_index);
+        assert_eq!(stored.exclusions, settings.exclusions);
+        assert!(stored.autostart && stored.close_hint_seen);
         Ok(())
     }
 
