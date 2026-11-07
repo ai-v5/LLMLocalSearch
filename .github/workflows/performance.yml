@@ -1,0 +1,41 @@
+name: Synthetic performance acceptance
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  synthetic-index:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[bench]')
+    runs-on: windows-2025
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Record runner configuration
+        shell: pwsh
+        run: |
+          $machine = Get-CimInstance Win32_ComputerSystem
+          "logical_processors=$env:NUMBER_OF_PROCESSORS memory_bytes=$($machine.TotalPhysicalMemory)"
+          [System.Environment]::OSVersion.VersionString
+      - name: Build benchmark binaries
+        run: cargo build --locked --release --bin index-worker --example benchmark_query
+      - name: Generate the fixed synthetic corpus
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path '.cache' | Out-Null
+          python scripts/generate_benchmark.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build the complete synthetic index
+        run: python scripts/benchmark_index.py
+      - name: Measure synthetic query results
+        shell: pwsh
+        run: |
+          $results = & cargo run --locked --release --example benchmark_query -- .cache/benchmark-index/index.db
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $results
+          if (@($results | Where-Object { $_ -match 'hits=100000$' }).Count -ne 3) { throw 'Synthetic query results are incomplete' }

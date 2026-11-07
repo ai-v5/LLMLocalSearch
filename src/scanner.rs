@@ -12,6 +12,7 @@ pub struct ScanStats {
     pub discovered: u64,
     pub changed: u64,
     pub inaccessible: u64,
+    pub root_unavailable: bool,
 }
 
 pub fn kind(path: &Path) -> &'static str {
@@ -146,8 +147,20 @@ pub fn scan_root(
     exclusions: &[PathBuf],
     cancelled: impl Fn() -> bool,
 ) -> Result<ScanStats> {
+    scan_root_with_progress(connection, root, exclusions, cancelled, |_| Ok(()))
+}
+
+/// Allow bounded background work between individual metadata commits.
+pub fn scan_root_with_progress(
+    connection: &mut Connection,
+    root: &Path,
+    exclusions: &[PathBuf],
+    cancelled: impl Fn() -> bool,
+    mut progress: impl FnMut(&mut Connection) -> Result<()>,
+) -> Result<ScanStats> {
     let mut stats = ScanStats::default();
     if !root.is_dir() {
+        stats.root_unavailable = true;
         return Ok(stats);
     }
     let mut seen = HashSet::new();
@@ -177,6 +190,11 @@ pub fn scan_root(
                         if let Some(path) = entry.path().to_str() {
                             issues.insert(path.to_owned());
                         }
+                        if !root.is_dir() {
+                            stats.root_unavailable = true;
+                            completed = false;
+                            break;
+                        }
                     }
                 }
             }
@@ -186,10 +204,23 @@ pub fn scan_root(
                 if let Some(path) = error.path().and_then(|p| p.to_str()) {
                     issues.insert(path.to_owned());
                 }
+                if !root.is_dir() {
+                    stats.root_unavailable = true;
+                    completed = false;
+                    break;
+                }
             }
         }
+        if stats.discovered > 0 {
+            progress(connection)?;
+        }
     }
-    if completed {
+    // A root can disappear after traversal starts. Never interpret that as
+    // deletion of every file that the interrupted walk did not visit.
+    if !root.is_dir() {
+        stats.root_unavailable = true;
+    }
+    if completed && !stats.root_unavailable {
         let previous_issues = {
             let mut stmt = connection.prepare("SELECT path FROM scan_issues")?;
             stmt.query_map([], |r| r.get::<_, String>(0))?
@@ -201,10 +232,10 @@ pub fn scan_root(
                 tx.execute("DELETE FROM scan_issues WHERE path=?1", [&path])?;
             }
         }
-        for path in issues {
+        for path in &issues {
             tx.execute(
                 "INSERT OR REPLACE INTO scan_issues(path,category) VALUES(?1,'inaccessible')",
-                [&path],
+                [path],
             )?;
         }
         tx.commit()?;
@@ -221,14 +252,29 @@ pub fn scan_root(
             if !crate::paths::within(p, root)
                 || seen.contains(&path)
                 || exclusions.iter().any(|e| crate::paths::within(p, e))
+                || issues
+                    .iter()
+                    .any(|issue| crate::paths::within(p, Path::new(issue)))
             {
                 continue;
             }
+            if !root.is_dir() {
+                stats.root_unavailable = true;
+                break;
+            }
             // Only a confirmed missing file on an online root is removed. Access denied is retained.
             if fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
-                index::remove_path(connection, &path)?;
+                if root.is_dir() {
+                    index::remove_path(connection, &path)?;
+                } else {
+                    stats.root_unavailable = true;
+                    break;
+                }
             }
         }
+    }
+    if !root.is_dir() {
+        stats.root_unavailable = true;
     }
     Ok(stats)
 }
@@ -287,8 +333,45 @@ mod tests {
         scan_root(&mut db, &root, std::slice::from_ref(&ignored), || false)?;
         assert_eq!(index::stats(&db)?.files, 1);
         fs::rename(&root, temp.path().join("offline"))?;
-        scan_root(&mut db, &root, &[], || false)?;
+        let offline_scan = scan_root(&mut db, &root, &[], || false)?;
+        assert!(offline_scan.root_unavailable);
         assert_eq!(index::stats(&db)?.files, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn drive_disappearing_during_scan_preserves_unseen_files() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("files");
+        let offline = temp.path().join("offline");
+        fs::create_dir(&root)?;
+        for number in 0..20 {
+            fs::write(root.join(format!("synthetic-{number}.txt")), "合成正文")?;
+        }
+        let mut db = index::open(&temp.path().join("index.db"))?;
+        scan_root(&mut db, &root, &[], || false)?;
+        assert_eq!(index::stats(&db)?.files, 20);
+        let mut moved = false;
+        let interrupted = scan_root_with_progress(
+            &mut db,
+            &root,
+            &[],
+            || false,
+            |_| {
+                if !moved {
+                    fs::rename(&root, &offline)?;
+                    moved = true;
+                }
+                Ok(())
+            },
+        )?;
+        assert!(moved);
+        assert!(interrupted.root_unavailable);
+        assert_eq!(index::stats(&db)?.files, 20, "offline files were removed");
+        fs::rename(&offline, &root)?;
+        let recovered = scan_root(&mut db, &root, &[], || false)?;
+        assert!(!recovered.root_unavailable);
+        assert_eq!(index::stats(&db)?.files, 20);
         Ok(())
     }
 }

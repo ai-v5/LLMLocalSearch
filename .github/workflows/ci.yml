@@ -22,3 +22,57 @@ jobs:
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Test with synthetic files
         run: cargo test --locked
+
+  installer:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Check out the published 0.1.0 source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: 18de7d34f5e3b8b75340c4c3708822e41f8f07dc
+          path: .cache/legacy-source
+          persist-credentials: false
+      - name: Download pinned build dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $downloads = Join-Path $env:RUNNER_TEMP 'llmlocalsearch-dependencies'
+          New-Item -ItemType Directory -Path $downloads | Out-Null
+          function Get-VerifiedFile([string]$name, [string[]]$urls, [string]$output, [string]$algorithm, [string]$expected) {
+            foreach ($url in $urls) {
+              for ($attempt = 0; $attempt -lt 2; $attempt++) {
+                try {
+                  Invoke-WebRequest $url -OutFile $output -TimeoutSec 90
+                  if ((Get-FileHash -LiteralPath $output -Algorithm $algorithm).Hash -eq $expected) {
+                    Write-Output "$name checksum verified"
+                    return
+                  }
+                } catch { Write-Warning "$name download attempt failed" }
+              }
+            }
+            throw "Unable to download verified $name"
+          }
+          Get-VerifiedFile 'Tika' @('https://dlcdn.apache.org/tika/3.3.3/tika-app-3.3.3.jar','https://archive.apache.org/dist/tika/3.3.3/tika-app-3.3.3.jar') (Join-Path $downloads 'tika.jar') 'SHA512' '3C6E62E864E32AF234832EC6D928BBC58692D3DDD60564CD8C80DEE7E161653D6EFCBA373B6CC9468C778010BEA92BDEE5CA75AB24F01923480BEC1B29B573FD'
+          Get-VerifiedFile 'JRE' @('https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.13%2B9/OpenJDK21U-jre_x64_windows_hotspot_21.0.13_9.zip') (Join-Path $downloads 'jre.zip') 'SHA256' '2332C0B4CFF6BED722DA3567C91D5E47568BCBA863FA4945D0A8D6FC76158628'
+          Get-VerifiedFile 'NSIS' @('https://distfiles.macports.org/nsis/nsis-3.11.zip','https://downloads.sourceforge.net/project/nsis/NSIS%203/3.11/nsis-3.11.zip') (Join-Path $downloads 'nsis.zip') 'SHA256' 'C7D27F780DDB6CFFB4730138CD1591E841F4B7EDB155856901CDF5F214394FA1'
+          Expand-Archive -LiteralPath (Join-Path $downloads 'nsis.zip') -DestinationPath $downloads
+      - name: Build the 0.1.0 installer with verified dependencies
+        shell: pwsh
+        run: |
+          $downloads = Join-Path $env:RUNNER_TEMP 'llmlocalsearch-dependencies'
+          ./.cache/legacy-source/scripts/package.ps1 -TikaJar (Join-Path $downloads 'tika.jar') -JavaZip (Join-Path $downloads 'jre.zip') -MakeNsis (Join-Path $downloads 'nsis-3.11/makensis.exe')
+      - name: Build installer with verified dependencies
+        shell: pwsh
+        run: |
+          $downloads = Join-Path $env:RUNNER_TEMP 'llmlocalsearch-dependencies'
+          ./scripts/package.ps1 -TikaJar (Join-Path $downloads 'tika.jar') -JavaZip (Join-Path $downloads 'jre.zip') -MakeNsis (Join-Path $downloads 'nsis-3.11/makensis.exe')
+      - name: Verify synthetic installation and data preservation
+        shell: pwsh
+        run: ./tests/installer_smoke.ps1
+      - name: Verify 0.1.0 upgrade and legacy-index migration
+        shell: pwsh
+        run: ./tests/legacy_upgrade_smoke.ps1

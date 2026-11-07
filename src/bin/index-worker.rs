@@ -1,7 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-use anyhow::{Context, Result};
-use llmlocalsearch::{index, paths, scanner, text, tika};
+use anyhow::{Context, Result, bail};
+use llmlocalsearch::{index, paths, scanner, settings, text, tika};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashMap;
@@ -35,6 +35,17 @@ fn send_status(state: &str, stats: Option<index::IndexStats>) {
     let _ = writeln!(output, "{value}");
 }
 
+fn send_compaction_progress(stats: index::IndexStats, copied: u64, total: u64) {
+    let mut output = std::io::stdout().lock();
+    let value = serde_json::json!({
+        "state":"optimizing", "files":stats.files, "pending":stats.pending,
+        "indexed":stats.indexed, "failed":stats.failed, "name_only":stats.name_only,
+        "no_text":stats.no_text, "cloud":stats.cloud, "scan_errors":stats.scan_errors,
+        "copied":copied, "total":total
+    });
+    let _ = writeln!(output, "{value}");
+}
+
 fn start_control() -> Arc<Control> {
     let control = Arc::new(Control::default());
     let shared = control.clone();
@@ -60,6 +71,138 @@ fn start_control() -> Arc<Control> {
         shared.stop.store(true, Ordering::Relaxed);
     });
     control
+}
+
+enum UpgradeOutcome {
+    Current,
+    Upgraded,
+    LegacyFallback,
+    Stopped,
+}
+
+fn upgrade_index(
+    connection: &mut Connection,
+    database: &Path,
+    control: &Arc<Control>,
+) -> Result<UpgradeOutcome> {
+    let mut last_report = Instant::now() - Duration::from_secs(2);
+    let mut space_check = Instant::now() - Duration::from_secs(5);
+    loop {
+        if control.stop.load(Ordering::Relaxed) {
+            return Ok(UpgradeOutcome::Stopped);
+        }
+        if control.paused.load(Ordering::Relaxed) || control.resource_paused.load(Ordering::Relaxed)
+        {
+            if last_report.elapsed() >= Duration::from_secs(1) {
+                send_status(
+                    if control.paused.load(Ordering::Relaxed) {
+                        "paused"
+                    } else {
+                        "resource_paused"
+                    },
+                    index::stats(connection).ok(),
+                );
+                last_report = Instant::now();
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        if control.searching.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        let step = (|| -> Result<index::CompactStep> {
+            if space_check.elapsed() >= Duration::from_secs(5) {
+                let directory = database.parent().context("索引目录无效")?;
+                if settings::available_space(directory)? < 256 * 1024 * 1024 {
+                    bail!("索引目录可用空间不足");
+                }
+                space_check = Instant::now();
+            }
+            index::compact_legacy_step(connection, 16)
+        })();
+        match step {
+            Ok(index::CompactStep::Current) => return Ok(UpgradeOutcome::Current),
+            Ok(index::CompactStep::Finished { .. }) => return Ok(UpgradeOutcome::Upgraded),
+            Ok(index::CompactStep::Copying { copied, total }) => {
+                if last_report.elapsed() >= Duration::from_secs(1) {
+                    if let Ok(stats) = index::stats(connection) {
+                        send_compaction_progress(stats, copied, total);
+                    }
+                    last_report = Instant::now();
+                }
+            }
+            Err(_) => {
+                // A failed conversion must not leave the old index silently
+                // write-locked. If cleanup itself fails, keep the old table
+                // queryable and wait for an explicit resume after repair.
+                loop {
+                    match index::abort_legacy_compaction(connection) {
+                        Ok(true) => return Ok(UpgradeOutcome::LegacyFallback),
+                        Ok(false) => return Ok(UpgradeOutcome::Current),
+                        Err(_) => send_status("optimization_blocked", None),
+                    }
+                    loop {
+                        if control.stop.load(Ordering::Relaxed) {
+                            return Ok(UpgradeOutcome::Stopped);
+                        }
+                        if control.rescan.swap(false, Ordering::Relaxed) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn reclaim_space_available(database: &Path) -> Result<bool> {
+    let parent = database.parent().context("索引目录无效")?;
+    let mut wal_name = database.as_os_str().to_os_string();
+    wal_name.push("-wal");
+    let wal = PathBuf::from(wal_name);
+    let size = std::fs::metadata(database)?
+        .len()
+        .saturating_add(std::fs::metadata(wal).map_or(0, |metadata| metadata.len()));
+    let required = size.saturating_mul(2).saturating_add(64 * 1024 * 1024);
+    Ok(settings::available_space(parent)? >= required)
+}
+
+fn reclaim_step(connection: &Connection, database: &Path, control: &Arc<Control>) -> Result<bool> {
+    match index::reclaim_phase(connection)? {
+        index::ReclaimPhase::None => Ok(true),
+        index::ReclaimPhase::Vacuum => {
+            if !reclaim_space_available(database)? {
+                send_status("reclaim_wait_space", None);
+                return Ok(false);
+            }
+            send_status("reclaiming", index::stats(connection).ok());
+            let control = control.clone();
+            let finished = index::reclaim_vacuum(connection, move || {
+                control.stop.load(Ordering::Relaxed)
+                    || control.paused.load(Ordering::Relaxed)
+                    || control.resource_paused.load(Ordering::Relaxed)
+                    || control.searching.load(Ordering::Relaxed)
+            })?;
+            if finished && index::reclaim_checkpoint(connection)? {
+                send_status("reclaimed", None);
+                Ok(true)
+            } else {
+                send_status("reclaim_deferred", None);
+                Ok(false)
+            }
+        }
+        index::ReclaimPhase::Checkpoint => {
+            let finished = index::reclaim_checkpoint(connection)?;
+            if finished {
+                send_status("reclaimed", None);
+            } else {
+                send_status("reclaim_deferred", None);
+            }
+            Ok(finished)
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -275,6 +418,67 @@ fn remove_missing(connection: &mut Connection, missing: &Path) -> Result<()> {
     Ok(())
 }
 
+fn handle_rename_from(connection: &mut Connection, roots: &[PathBuf], path: &Path) -> Result<bool> {
+    // Rename events may have waited in the queue while a root went offline.
+    // Preserve its old records and reconcile after the root is available.
+    if !roots
+        .iter()
+        .any(|root| root.is_dir() && paths::within(path, root))
+    {
+        return Ok(true);
+    }
+    // A queued rename can be older than a later reconciliation. If the same
+    // spelling exists again, keep it and rescan. A case-only rename needs the
+    // old key removed and a scan of the actual spelling.
+    let different_spelling = match std::fs::symlink_metadata(path) {
+        Ok(_) if scanner::event_path(path) == path => return Ok(true),
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => return Ok(true),
+    };
+    if !roots
+        .iter()
+        .any(|root| root.is_dir() && paths::within(path, root))
+    {
+        return Ok(true);
+    }
+    let known_file = path.to_str().is_some_and(|value| {
+        connection
+            .query_row("SELECT 1 FROM files WHERE path=?1", [value], |_| Ok(()))
+            .optional()
+            .ok()
+            .flatten()
+            .is_some()
+    });
+    if known_file {
+        if let Some(value) = path.to_str() {
+            index::remove_path(connection, value)?;
+        }
+        Ok(different_spelling)
+    } else {
+        remove_missing(connection, path)?;
+        Ok(true)
+    }
+}
+
+fn mark_offline_roots(roots: &[PathBuf], available: &mut [bool], path: &Path) -> bool {
+    let mut offline = false;
+    for (root, was_available) in roots.iter().zip(available) {
+        if paths::within(path, root) && !root.is_dir() {
+            *was_available = false;
+            offline = true;
+        }
+    }
+    offline
+}
+
+fn root_returned(root: &Path, was_available: &mut bool) -> bool {
+    let present = root.is_dir();
+    let returned = present && !*was_available;
+    *was_available = present;
+    returned
+}
+
 fn main() -> Result<()> {
     #[cfg(windows)]
     unsafe {
@@ -305,6 +509,15 @@ fn main() -> Result<()> {
         std::thread::sleep(Duration::from_millis(25));
     }
     let mut connection = index::open(&db)?;
+    // The legacy table remains queryable during this restartable conversion.
+    // Reconciliation follows the conversion so no worker writes can race it.
+    let upgrade = upgrade_index(&mut connection, &db, &control)?;
+    match upgrade {
+        UpgradeOutcome::Stopped => return Ok(()),
+        UpgradeOutcome::LegacyFallback => send_status("optimization_fallback", None),
+        UpgradeOutcome::Upgraded => send_status("optimized", None),
+        UpgradeOutcome::Current => {}
+    }
     for excluded in &exclusions {
         remove_missing(&mut connection, excluded)?;
     }
@@ -326,6 +539,8 @@ fn main() -> Result<()> {
     let mut last_check = Instant::now();
     let mut pending_events: HashMap<PathBuf, Instant> = HashMap::new();
     let mut last_report = Instant::now() - Duration::from_secs(2);
+    let mut reclaim_pending = index::reclaim_phase(&connection)? != index::ReclaimPhase::None;
+    let mut reclaim_retry = Instant::now() + Duration::from_secs(10);
     loop {
         if control.stop.load(Ordering::Relaxed) {
             break;
@@ -347,14 +562,12 @@ fn main() -> Result<()> {
                 }
             }
             for (i, root) in roots.iter().enumerate() {
-                let present = root.is_dir();
-                if present && !available[i] {
+                if root_returned(root, &mut available[i]) {
                     if watcher.watch(root, RecursiveMode::Recursive).is_err() {
                         send_status("watch_failed", None);
                     }
                     control.rescan.store(true, Ordering::Relaxed);
                 }
-                available[i] = present;
             }
             availability_check = Instant::now();
         }
@@ -374,6 +587,19 @@ fn main() -> Result<()> {
             std::thread::sleep(Duration::from_millis(100));
             continue;
         }
+        if reclaim_pending
+            && !control.searching.load(Ordering::Relaxed)
+            && Instant::now() >= reclaim_retry
+        {
+            match reclaim_step(&connection, &db, &control) {
+                Ok(true) => reclaim_pending = false,
+                Ok(false) => reclaim_retry = Instant::now() + Duration::from_secs(30),
+                Err(_) => {
+                    send_status("reclaim_failed", None);
+                    reclaim_retry = Instant::now() + Duration::from_secs(300);
+                }
+            }
+        }
         if last_check.elapsed() >= Duration::from_secs(24 * 60 * 60) {
             control.rescan.store(true, Ordering::Relaxed);
         }
@@ -381,15 +607,47 @@ fn main() -> Result<()> {
             && control.rescan.swap(false, Ordering::Relaxed)
         {
             send_status("scanning", index::stats(&connection).ok());
-            for root in &roots {
+            let mut last_scan_content = Instant::now() - Duration::from_secs(5);
+            let mut last_scan_report = Instant::now() - Duration::from_secs(5);
+            for (i, root) in roots.iter().enumerate() {
                 if control.stop.load(Ordering::Relaxed) {
                     break;
                 }
-                scanner::scan_root(&mut connection, root, &exclusions, || {
-                    control.stop.load(Ordering::Relaxed)
-                        || control.paused.load(Ordering::Relaxed)
-                        || control.resource_paused.load(Ordering::Relaxed)
-                })?;
+                let scan = scanner::scan_root_with_progress(
+                    &mut connection,
+                    root,
+                    &exclusions,
+                    || {
+                        control.stop.load(Ordering::Relaxed)
+                            || control.paused.load(Ordering::Relaxed)
+                            || control.resource_paused.load(Ordering::Relaxed)
+                    },
+                    |connection| {
+                        if control.stop.load(Ordering::Relaxed)
+                            || control.paused.load(Ordering::Relaxed)
+                            || control.resource_paused.load(Ordering::Relaxed)
+                            || control.searching.load(Ordering::Relaxed)
+                        {
+                            return Ok(());
+                        }
+                        if last_scan_content.elapsed() >= Duration::from_secs(5) {
+                            if let Some(record) = pending(connection)?.into_iter().next()
+                                && let Some(update) = extract_one(connection, &runtime, record)?
+                            {
+                                flush_batch(connection, &mut vec![update])?;
+                            }
+                            last_scan_content = Instant::now();
+                        }
+                        if last_scan_report.elapsed() >= Duration::from_secs(5) {
+                            send_status("scanning", index::stats(connection).ok());
+                            last_scan_report = Instant::now();
+                        }
+                        Ok(())
+                    },
+                )?;
+                if scan.root_unavailable {
+                    available[i] = false;
+                }
                 if control.paused.load(Ordering::Relaxed)
                     || control.resource_paused.load(Ordering::Relaxed)
                 {
@@ -417,22 +675,9 @@ fn main() -> Result<()> {
                         }
                         if renamed_from {
                             pending_events.retain(|queued, _| !paths::within(queued, &path));
-                            let known_file = path.to_str().is_some_and(|value| {
-                                connection
-                                    .query_row("SELECT 1 FROM files WHERE path=?1", [value], |_| {
-                                        Ok(())
-                                    })
-                                    .optional()
-                                    .ok()
-                                    .flatten()
-                                    .is_some()
-                            });
-                            if known_file {
-                                if let Some(value) = path.to_str() {
-                                    index::remove_path(&mut connection, value)?;
-                                }
-                            } else {
-                                remove_missing(&mut connection, &path)?;
+                            let rescan = handle_rename_from(&mut connection, &roots, &path)?;
+                            let offline = mark_offline_roots(&roots, &mut available, &path);
+                            if rescan && !offline {
                                 control.rescan.store(true, Ordering::Relaxed);
                             }
                         } else {
@@ -456,6 +701,9 @@ fn main() -> Result<()> {
         for path in ready {
             pending_events.remove(&path);
             let path = scanner::event_path(&path);
+            if mark_offline_roots(&roots, &mut available, &path) {
+                continue;
+            }
             if path.is_dir() {
                 control.rescan.store(true, Ordering::Relaxed);
                 continue;
@@ -471,7 +719,9 @@ fn main() -> Result<()> {
                 {
                     remove_missing(&mut connection, &path)?
                 }
-                Err(_) => {}
+                Err(_) => {
+                    mark_offline_roots(&roots, &mut available, &path);
+                }
             }
         }
         if !control.searching.load(Ordering::Relaxed) {
@@ -510,4 +760,156 @@ fn main() -> Result<()> {
     }
     send_status("stopped", None);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delayed_rename_event_does_not_remove_an_offline_root_file() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("files");
+        let offline = temporary.path().join("offline");
+        std::fs::create_dir(&root)?;
+        let file = root.join("synthetic.txt");
+        std::fs::write(&file, "合成正文")?;
+        let mut db = index::open(&temporary.path().join("index.db"))?;
+        index::upsert_metadata(&mut db, &scanner::metadata_record(&file)?)?;
+        std::fs::rename(&root, &offline)?;
+        assert!(handle_rename_from(
+            &mut db,
+            std::slice::from_ref(&root),
+            &file
+        )?);
+        assert_eq!(index::stats(&db)?.files, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn delayed_directory_rename_preserves_offline_descendants() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("files");
+        let directory = root.join("nested");
+        std::fs::create_dir_all(&directory)?;
+        let mut db = index::open(&temporary.path().join("index.db"))?;
+        for number in 0..2 {
+            let file = directory.join(format!("synthetic-{number}.txt"));
+            std::fs::write(&file, "合成正文")?;
+            index::upsert_metadata(&mut db, &scanner::metadata_record(&file)?)?;
+        }
+        std::fs::rename(&root, temporary.path().join("offline"))?;
+        assert!(handle_rename_from(
+            &mut db,
+            std::slice::from_ref(&root),
+            &directory
+        )?);
+        assert_eq!(index::stats(&db)?.files, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn short_offline_event_is_remembered_until_the_root_returns() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("files");
+        let offline = temporary.path().join("offline");
+        std::fs::create_dir(&root)?;
+        let path = root.join("synthetic.txt");
+        std::fs::write(&path, "合成正文")?;
+        let roots = vec![root.clone()];
+        let mut available = vec![true];
+        std::fs::rename(&root, &offline)?;
+        assert!(mark_offline_roots(&roots, &mut available, &path));
+        assert!(!available[0]);
+        std::fs::rename(&offline, &root)?;
+        assert!(root_returned(&root, &mut available[0]));
+        assert!(!root_returned(&root, &mut available[0]));
+        Ok(())
+    }
+
+    #[test]
+    fn rename_event_on_an_online_root_removes_the_old_name() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("files");
+        std::fs::create_dir(&root)?;
+        let old = root.join("old.txt");
+        std::fs::write(&old, "合成正文")?;
+        let mut db = index::open(&temporary.path().join("index.db"))?;
+        index::upsert_metadata(&mut db, &scanner::metadata_record(&old)?)?;
+        std::fs::rename(&old, root.join("new.txt"))?;
+        assert!(!handle_rename_from(
+            &mut db,
+            std::slice::from_ref(&root),
+            &old
+        )?);
+        assert_eq!(index::stats(&db)?.files, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_rename_event_keeps_a_reused_file_path() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("files");
+        std::fs::create_dir(&root)?;
+        let old = root.join("old.txt");
+        std::fs::write(&old, "旧合成正文")?;
+        let mut db = index::open(&temporary.path().join("index.db"))?;
+        scanner::scan_root(&mut db, &root, &[], || false)?;
+        std::fs::rename(&old, root.join("new.txt"))?;
+        std::fs::write(&old, "重新创建的合成正文")?;
+        scanner::scan_root(&mut db, &root, &[], || false)?;
+        assert_eq!(index::stats(&db)?.files, 2);
+        handle_rename_from(&mut db, std::slice::from_ref(&root), &old)?;
+        assert_eq!(index::stats(&db)?.files, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_directory_rename_keeps_a_reused_subtree() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("files");
+        let old = root.join("old");
+        std::fs::create_dir_all(&old)?;
+        std::fs::write(old.join("first.txt"), "合成正文")?;
+        let mut db = index::open(&temporary.path().join("index.db"))?;
+        scanner::scan_root(&mut db, &root, &[], || false)?;
+        std::fs::rename(&old, root.join("new"))?;
+        std::fs::create_dir(&old)?;
+        std::fs::write(old.join("second.txt"), "新合成正文")?;
+        scanner::scan_root(&mut db, &root, &[], || false)?;
+        assert_eq!(index::stats(&db)?.files, 2);
+        handle_rename_from(&mut db, std::slice::from_ref(&root), &old)?;
+        assert_eq!(index::stats(&db)?.files, 2);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn case_only_rename_replaces_the_old_spelling() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("files");
+        std::fs::create_dir(&root)?;
+        let old = root.join("lower.txt");
+        std::fs::write(&old, "合成正文")?;
+        let mut db = index::open(&temporary.path().join("index.db"))?;
+        scanner::scan_root(&mut db, &root, &[], || false)?;
+        std::fs::rename(&old, root.join("LOWER.txt"))?;
+        assert!(handle_rename_from(
+            &mut db,
+            std::slice::from_ref(&root),
+            &old
+        )?);
+        scanner::scan_root(&mut db, &root, &[], || false)?;
+        let hits = index::search(
+            &db,
+            "lower",
+            llmlocalsearch::query::Scope::Name,
+            &[],
+            &[],
+            || false,
+        )?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].file.name, "LOWER.txt");
+        Ok(())
+    }
 }

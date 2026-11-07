@@ -5,6 +5,7 @@ use std::fs::OpenOptions;
 use std::path::Path;
 
 const APPLICATION_ID: i64 = 0x4c4c5358;
+const INDEX_SCHEMA_VERSION: i64 = 2;
 
 #[derive(Clone, Debug)]
 pub struct FileRecord {
@@ -53,6 +54,67 @@ pub struct IndexStats {
     pub scan_errors: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompactStep {
+    Current,
+    Copying { copied: u64, total: u64 },
+    Finished { copied: u64 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReclaimPhase {
+    None,
+    Vacuum,
+    Checkpoint,
+}
+
+fn supported_schema(connection: &Connection, allow_empty: bool) -> Result<Option<String>> {
+    // The worker may swap the FTS table while a new reader is opening. Version
+    // and schema must be inspected from one snapshot to avoid a false mismatch.
+    let snapshot = connection.unchecked_transaction()?;
+    let version: i64 = snapshot.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version != 0 && version != INDEX_SCHEMA_VERSION {
+        bail!("索引版本不受当前程序支持");
+    }
+    let terms: Option<String> = snapshot
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='terms'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match terms.as_deref() {
+        Some(sql) => {
+            let sql = sql.to_ascii_lowercase();
+            let valid_legacy =
+                version == 0 && sql.contains("using fts5") && !sql.contains("contentless_delete");
+            let valid_current = version == INDEX_SCHEMA_VERSION
+                && sql.contains("contentless_delete")
+                && sql.contains("detail=column");
+            if !valid_legacy && !valid_current {
+                bail!("索引结构与版本不一致");
+            }
+        }
+        None if allow_empty && version == 0 => {
+            let files_exist: bool = snapshot.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='files')",
+                [],
+                |row| row.get(0),
+            )?;
+            if files_exist {
+                let files: i64 =
+                    snapshot.query_row("SELECT count(*) FROM files", [], |row| row.get(0))?;
+                if files != 0 {
+                    bail!("索引缺少搜索表，未修改现有文件记录");
+                }
+            }
+        }
+        None => bail!("索引缺少搜索表"),
+    }
+    snapshot.commit()?;
+    Ok(terms)
+}
+
 pub fn open(path: &Path) -> Result<Connection> {
     let created = match OpenOptions::new().write(true).create_new(true).open(path) {
         Ok(_) => true,
@@ -77,6 +139,7 @@ pub fn open(path: &Path) -> Result<Connection> {
             bail!("目标位置存在其他数据库，未修改");
         }
     }
+    let terms = supported_schema(&connection, true)?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS files (
@@ -93,9 +156,18 @@ pub fn open(path: &Path) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS files_state_modified ON files(state, modified_ms DESC, id);
         CREATE TABLE IF NOT EXISTS retries(file_id INTEGER PRIMARY KEY, attempts INTEGER NOT NULL, next_ms INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS retries_next ON retries(next_ms);
-        CREATE TABLE IF NOT EXISTS scan_issues(path TEXT PRIMARY KEY, category TEXT NOT NULL);
-        CREATE VIRTUAL TABLE IF NOT EXISTS terms USING fts5(name_grams, body_grams, tokenize='ascii');",
+        CREATE TABLE IF NOT EXISTS scan_issues(path TEXT PRIMARY KEY, category TEXT NOT NULL);",
     )?;
+    if terms.is_none() {
+        // Original text is kept in `files`; FTS only needs the per-column posting lists.
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE VIRTUAL TABLE terms USING fts5(name_grams, body_grams,
+                 tokenize='ascii', content='', contentless_delete=1, detail=column);
+             PRAGMA user_version=2;
+             COMMIT;",
+        )?;
+    }
     Ok(connection)
 }
 
@@ -106,7 +178,231 @@ pub fn open_reader(path: &Path) -> Result<Connection> {
     if id != APPLICATION_ID {
         bail!("目标位置存在其他数据库，未修改");
     }
+    supported_schema(&connection, false)?;
     Ok(connection)
+}
+
+/// Convert one bounded batch of a version-0 FTS table. The old search table stays
+/// readable until the compact replacement is complete and swapped atomically.
+pub fn compact_legacy_step(connection: &mut Connection, batch_size: usize) -> Result<CompactStep> {
+    if batch_size == 0 {
+        bail!("索引优化批量大小无效");
+    }
+    let batch_limit = i64::try_from(batch_size).context("索引优化批量大小无效")?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let version: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version == INDEX_SCHEMA_VERSION {
+        tx.commit()?;
+        return Ok(CompactStep::Current);
+    }
+    if version != 0 {
+        bail!("索引版本不受当前程序支持");
+    }
+    // Block a concurrently launched older worker from changing files while a
+    // partially built replacement exists. A failed old transaction rolls back.
+    tx.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS terms_compacting USING fts5(name_grams, body_grams,
+             tokenize='ascii', content='', contentless_delete=1, detail=column);
+         CREATE TABLE IF NOT EXISTS index_compaction_state(
+             singleton INTEGER PRIMARY KEY CHECK(singleton=1), last_id INTEGER NOT NULL,
+             copied INTEGER NOT NULL, total INTEGER NOT NULL);
+         CREATE TRIGGER IF NOT EXISTS index_compaction_guard_insert BEFORE INSERT ON files
+             BEGIN SELECT RAISE(ABORT, 'Index optimization in progress'); END;
+         CREATE TRIGGER IF NOT EXISTS index_compaction_guard_update BEFORE UPDATE ON files
+             BEGIN SELECT RAISE(ABORT, 'Index optimization in progress'); END;
+         CREATE TRIGGER IF NOT EXISTS index_compaction_guard_delete BEFORE DELETE ON files
+             BEGIN SELECT RAISE(ABORT, 'Index optimization in progress'); END;",
+    )?;
+    let state: Option<(i64, i64, i64)> = tx
+        .query_row(
+            "SELECT last_id,copied,total FROM index_compaction_state WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let (last_id, previous, total) = if let Some(state) = state {
+        state
+    } else {
+        let total: i64 = tx.query_row("SELECT count(*) FROM files", [], |row| row.get(0))?;
+        tx.execute(
+            "INSERT INTO index_compaction_state VALUES(1,0,0,?1)",
+            [total],
+        )?;
+        (0, 0, total)
+    };
+    if last_id < 0 || previous < 0 || total < 0 {
+        bail!("索引优化状态无效");
+    }
+    let (rows, exhausted) = {
+        let mut statement = tx.prepare(
+            "SELECT rowid,name_grams,body_grams FROM terms WHERE rowid>?1 ORDER BY rowid LIMIT ?2",
+        )?;
+        let mut query = statement.query(params![last_id, batch_limit])?;
+        let mut rows = Vec::new();
+        let mut bytes = 0usize;
+        let mut exhausted = false;
+        while rows.len() < batch_size && bytes < 4 * 1024 * 1024 {
+            let Some(row) = query.next()? else {
+                exhausted = true;
+                break;
+            };
+            let name: String = row.get(1)?;
+            let body: String = row.get(2)?;
+            bytes = bytes.saturating_add(name.len()).saturating_add(body.len());
+            rows.push((row.get::<_, i64>(0)?, name, body));
+        }
+        (rows, exhausted)
+    };
+    for (id, name, body) in &rows {
+        tx.execute(
+            "INSERT INTO terms_compacting(rowid,name_grams,body_grams) VALUES(?1,?2,?3)",
+            params![id, name, body],
+        )?;
+    }
+    let copied = previous
+        .checked_add(rows.len() as i64)
+        .context("索引优化计数溢出")?;
+    let newest = rows.last().map_or(last_id, |row| row.0);
+    tx.execute(
+        "UPDATE index_compaction_state SET last_id=?1,copied=?2 WHERE singleton=1",
+        params![newest, copied],
+    )?;
+    if exhausted {
+        let files: i64 = tx.query_row("SELECT count(*) FROM files", [], |row| row.get(0))?;
+        let original: i64 = tx.query_row("SELECT count(*) FROM terms", [], |row| row.get(0))?;
+        let replacement: i64 =
+            tx.query_row("SELECT count(*) FROM terms_compacting", [], |row| {
+                row.get(0)
+            })?;
+        if total != files || files != original || original != replacement || replacement != copied {
+            bail!("索引优化校验失败，原搜索表仍保留");
+        }
+        tx.execute_batch(
+            "DROP TABLE terms;
+             ALTER TABLE terms_compacting RENAME TO terms;
+             DROP TRIGGER index_compaction_guard_insert;
+             DROP TRIGGER index_compaction_guard_update;
+             DROP TRIGGER index_compaction_guard_delete;
+             DROP TABLE index_compaction_state;
+             CREATE TABLE IF NOT EXISTS index_maintenance(
+                 singleton INTEGER PRIMARY KEY CHECK(singleton=1), reclaim_pending INTEGER NOT NULL);
+             INSERT OR REPLACE INTO index_maintenance VALUES(1,1);
+             PRAGMA user_version=2;",
+        )?;
+        tx.commit()?;
+        Ok(CompactStep::Finished {
+            copied: copied as u64,
+        })
+    } else {
+        tx.commit()?;
+        Ok(CompactStep::Copying {
+            copied: copied as u64,
+            total: total as u64,
+        })
+    }
+}
+
+pub fn reclaim_phase(connection: &Connection) -> Result<ReclaimPhase> {
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='index_maintenance')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(ReclaimPhase::None);
+    }
+    let state = connection
+        .query_row(
+            "SELECT reclaim_pending FROM index_maintenance WHERE singleton=1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    match state {
+        None | Some(0) => Ok(ReclaimPhase::None),
+        Some(1) => Ok(ReclaimPhase::Vacuum),
+        Some(2) => Ok(ReclaimPhase::Checkpoint),
+        _ => bail!("索引空间整理状态无效"),
+    }
+}
+
+/// VACUUM is atomic in SQLite; an interruption leaves the current database
+/// usable and the pending marker intact for a later retry.
+pub fn reclaim_vacuum(
+    connection: &Connection,
+    mut cancelled: impl FnMut() -> bool + Send + 'static,
+) -> Result<bool> {
+    if cancelled() {
+        return Ok(false);
+    }
+    connection.progress_handler(1000, Some(cancelled))?;
+    let result = connection.execute_batch("VACUUM");
+    connection.progress_handler(0, None::<fn() -> bool>)?;
+    match result {
+        Ok(()) => {
+            connection.execute(
+                "UPDATE index_maintenance SET reclaim_pending=2 WHERE singleton=1",
+                [],
+            )?;
+            Ok(true)
+        }
+        Err(rusqlite::Error::SqliteFailure(error, _))
+            if error.code == rusqlite::ErrorCode::OperationInterrupted =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Finish the WAL checkpoint without waiting on an interactive reader.
+pub fn reclaim_checkpoint(connection: &Connection) -> Result<bool> {
+    connection.busy_timeout(std::time::Duration::from_millis(100))?;
+    let result = connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    });
+    connection.busy_timeout(std::time::Duration::from_secs(3))?;
+    let (busy, _, _) = result?;
+    if busy != 0 {
+        return Ok(false);
+    }
+    connection.execute("DROP TABLE IF EXISTS index_maintenance", [])?;
+    Ok(true)
+}
+
+/// Discard only the derived, incomplete replacement. The version-0 search
+/// table and file records remain intact; callers must report a failed cleanup.
+pub fn abort_legacy_compaction(connection: &mut Connection) -> Result<bool> {
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let version: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version == INDEX_SCHEMA_VERSION {
+        tx.commit()?;
+        return Ok(false);
+    }
+    if version != 0 {
+        bail!("索引版本不受当前程序支持");
+    }
+    let original_exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='terms')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !original_exists {
+        bail!("原搜索表不存在，无法撤销索引优化");
+    }
+    tx.execute_batch(
+        "DROP TRIGGER IF EXISTS index_compaction_guard_insert;
+         DROP TRIGGER IF EXISTS index_compaction_guard_update;
+         DROP TRIGGER IF EXISTS index_compaction_guard_delete;
+         DROP TABLE IF EXISTS terms_compacting;
+         DROP TABLE IF EXISTS index_compaction_state;",
+    )?;
+    tx.commit()?;
+    Ok(true)
 }
 
 /// Metadata changes invalidate stale content in the same transaction as the FTS update.
@@ -464,6 +760,326 @@ mod tests {
     }
 
     #[test]
+    fn fresh_index_does_not_duplicate_generated_gram_text() -> Result<()> {
+        let temp = tempdir()?;
+        let db = open(&temp.path().join("index.db"))?;
+        let redundant_tables: i64 = db.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name='terms_content'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            redundant_tables, 0,
+            "generated n-grams must not be stored twice"
+        );
+        Ok(())
+    }
+
+    fn legacy_index(path: &Path) -> Result<Connection> {
+        let db = open(path)?;
+        db.execute_batch(
+            "DROP TABLE terms;
+             CREATE VIRTUAL TABLE terms USING fts5(name_grams,body_grams,tokenize='ascii');
+             PRAGMA user_version=0;",
+        )?;
+        Ok(db)
+    }
+
+    #[test]
+    fn legacy_compaction_can_resume_without_losing_search_or_writes() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("legacy.db");
+        let mut db = legacy_index(&path)?;
+        upsert_metadata(&mut db, &record("one", "项目报告.txt", 10))?;
+        upsert_metadata(&mut db, &record("two", "其他.txt", 20))?;
+        upsert_metadata(&mut db, &record("three", "最近.txt", 30))?;
+        set_body(
+            &mut db,
+            "one",
+            10,
+            1,
+            Some("包含 GPU 和中文短语"),
+            "indexed",
+        )?;
+        set_body(&mut db, "two", 20, 1, Some("项目报告 GPU"), "indexed")?;
+        let queries = [
+            ("项", Scope::Both),
+            ("项目", Scope::Content),
+            ("项目报告 GPU", Scope::Both),
+            ("报告", Scope::Name),
+            ("\"中文短语\"", Scope::Content),
+        ];
+        let snapshot = |connection: &Connection| -> Result<Vec<Vec<String>>> {
+            queries
+                .iter()
+                .map(|(value, scope)| {
+                    Ok(search(connection, value, *scope, &[], &[], || false)?
+                        .into_iter()
+                        .map(|hit| hit.file.path)
+                        .collect())
+                })
+                .collect()
+        };
+        let expected = snapshot(&db)?;
+        assert_eq!(
+            compact_legacy_step(&mut db, 1)?,
+            CompactStep::Copying {
+                copied: 1,
+                total: 3
+            }
+        );
+        assert_eq!(snapshot(&open_reader(&path)?)?, expected);
+        assert!(upsert_metadata(&mut db, &record("new", "new.txt", 40)).is_err());
+        assert_eq!(stats(&db)?.files, 3);
+        drop(db);
+
+        let mut db = open(&path)?;
+        loop {
+            match compact_legacy_step(&mut db, 1)? {
+                CompactStep::Copying { .. } => {}
+                CompactStep::Finished { copied } => {
+                    assert_eq!(copied, 3);
+                    break;
+                }
+                CompactStep::Current => panic!("unfinished migration was silently skipped"),
+            }
+        }
+        assert_eq!(snapshot(&db)?, expected);
+        assert_eq!(compact_legacy_step(&mut db, 1)?, CompactStep::Current);
+        assert_eq!(reclaim_phase(&db)?, ReclaimPhase::Vacuum);
+        assert!(!reclaim_vacuum(&db, || true)?);
+        assert_eq!(reclaim_phase(&db)?, ReclaimPhase::Vacuum);
+        assert_eq!(snapshot(&db)?, expected);
+        assert!(reclaim_vacuum(&db, || false)?);
+        assert_eq!(reclaim_phase(&db)?, ReclaimPhase::Checkpoint);
+        assert!(reclaim_checkpoint(&db)?);
+        assert_eq!(reclaim_phase(&db)?, ReclaimPhase::None);
+        assert_eq!(snapshot(&db)?, expected);
+        let content: i64 = db.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name IN ('terms_content','terms_compacting_content')",
+            [], |row| row.get(0),
+        )?;
+        assert_eq!(content, 0);
+        upsert_metadata(&mut db, &record("new", "new.txt", 40))?;
+        set_body(&mut db, "new", 40, 1, Some("恢复写入"), "indexed")?;
+        assert_eq!(
+            search(&db, "恢复写入", Scope::Content, &[], &[], || false)?.len(),
+            1
+        );
+        remove_path(&mut db, "new")?;
+        assert!(search(&db, "恢复写入", Scope::Content, &[], &[], || false)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn inconsistent_legacy_index_is_not_swapped() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("legacy.db");
+        let mut db = legacy_index(&path)?;
+        upsert_metadata(&mut db, &record("one", "one.txt", 10))?;
+        db.execute("DELETE FROM terms", [])?;
+        assert!(compact_legacy_step(&mut db, 10).is_err());
+        let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        assert_eq!(version, 0);
+        let old_content: i64 = db.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name='terms_content'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(old_content, 1);
+        assert_eq!(stats(&db)?.files, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_partial_compaction_can_restore_legacy_writes() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("legacy.db");
+        let mut db = legacy_index(&path)?;
+        for (id, name) in [("one", "一.txt"), ("two", "二.txt"), ("three", "三.txt")] {
+            upsert_metadata(&mut db, &record(id, name, 1))?;
+            set_body(&mut db, id, 1, 1, Some("合成内容"), "indexed")?;
+        }
+        assert_eq!(
+            compact_legacy_step(&mut db, 1)?,
+            CompactStep::Copying {
+                copied: 1,
+                total: 3
+            }
+        );
+        db.execute("DELETE FROM terms_compacting WHERE rowid=1", [])?;
+        assert!(matches!(
+            compact_legacy_step(&mut db, 1)?,
+            CompactStep::Copying { .. }
+        ));
+        assert!(matches!(
+            compact_legacy_step(&mut db, 1)?,
+            CompactStep::Copying { .. }
+        ));
+        assert!(compact_legacy_step(&mut db, 1).is_err());
+        assert_eq!(
+            search(&db, "合成内容", Scope::Content, &[], &[], || false)?.len(),
+            3
+        );
+        assert!(abort_legacy_compaction(&mut db)?);
+        assert_eq!(
+            search(&db, "合成内容", Scope::Content, &[], &[], || false)?.len(),
+            3
+        );
+        upsert_metadata(&mut db, &record("new", "新.txt", 2))?;
+        assert_eq!(stats(&db)?.files, 4);
+        let leftovers: i64 = db.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name IN ('terms_compacting','index_compaction_state','index_compaction_guard_insert','index_compaction_guard_update','index_compaction_guard_delete')",
+            [], |row| row.get(0),
+        )?;
+        assert_eq!(leftovers, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn full_database_during_compaction_preserves_old_index() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("legacy.db");
+        let mut db = legacy_index(&path)?;
+        let alphabet: Vec<char> = "本地搜索文件内容模型数据文档索引排序后台测试"
+            .chars()
+            .collect();
+        let mut seed = 0x5eed_u64;
+        for number in 0..20 {
+            let mut body = String::from("合成磁盘空间标记");
+            for _ in 0..1500 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                body.push(alphabet[((seed >> 32) as usize) % alphabet.len()]);
+            }
+            let name = format!("synthetic-{number}.txt");
+            upsert_metadata(&mut db, &record(&name, &name, number))?;
+            set_body(&mut db, &name, number, 1, Some(&body), "indexed")?;
+        }
+        db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        let pages: i64 = db.pragma_query_value(None, "page_count", |row| row.get(0))?;
+        db.pragma_update(None, "max_page_count", pages + 2)?;
+        let mut full = false;
+        for _ in 0..30 {
+            match compact_legacy_step(&mut db, 1) {
+                Err(error) => {
+                    full = error.chain().any(|cause| {
+                        cause.downcast_ref::<rusqlite::Error>().is_some_and(|error| {
+                            matches!(error, rusqlite::Error::SqliteFailure(code, _) if code.code == rusqlite::ErrorCode::DiskFull)
+                        })
+                    });
+                    break;
+                }
+                Ok(CompactStep::Copying { .. }) => {}
+                Ok(_) => break,
+            }
+        }
+        assert!(
+            full,
+            "synthetic page limit did not trigger SQLite disk-full handling"
+        );
+        assert_eq!(
+            search(&db, "合成磁盘空间标记", Scope::Content, &[], &[], || false)?.len(),
+            20
+        );
+        db.pragma_update(None, "max_page_count", pages + 1000)?;
+        assert!(abort_legacy_compaction(&mut db)?);
+        upsert_metadata(&mut db, &record("after", "after.txt", 99))?;
+        assert_eq!(
+            search(&db, "after", Scope::Name, &[], &[], || false)?.len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reclaim_checkpoint_defers_for_a_live_reader() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("legacy.db");
+        let mut db = legacy_index(&path)?;
+        upsert_metadata(&mut db, &record("one", "一.txt", 1))?;
+        set_body(&mut db, "one", 1, 1, Some("合成读取"), "indexed")?;
+        let reader = open_reader(&path)?;
+        reader.execute_batch("BEGIN")?;
+        let count: i64 = reader.query_row("SELECT count(*) FROM files", [], |row| row.get(0))?;
+        assert_eq!(count, 1);
+        assert!(matches!(
+            compact_legacy_step(&mut db, 8)?,
+            CompactStep::Finished { copied: 1 }
+        ));
+        assert!(reclaim_vacuum(&db, || false)?);
+        let start = std::time::Instant::now();
+        assert!(!reclaim_checkpoint(&db)?);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(reclaim_phase(&db)?, ReclaimPhase::Checkpoint);
+        reader.execute_batch("COMMIT")?;
+        drop(reader);
+        assert!(reclaim_checkpoint(&db)?);
+        assert_eq!(reclaim_phase(&db)?, ReclaimPhase::None);
+        assert_eq!(
+            search(&db, "合成读取", Scope::Content, &[], &[], || false)?.len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compacted_synthetic_index_reclaims_disk_space() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("legacy.db");
+        let mut db = legacy_index(&path)?;
+        let alphabet: Vec<char> =
+            "本地搜索文件内容性能系统模型数据文档索引排序后台测试电脑时间目录状态更新样例"
+                .chars()
+                .collect();
+        let mut seed = 0x5eed_u64;
+        for number in 0..80 {
+            let mut body = String::from("合成空间标记");
+            for _ in 0..900 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                body.push(alphabet[((seed >> 32) as usize) % alphabet.len()]);
+            }
+            let name = format!("synthetic-{number}.txt");
+            upsert_metadata(&mut db, &record(&name, &name, number))?;
+            set_body(&mut db, &name, number, 1, Some(&body), "indexed")?;
+        }
+        db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        let before = std::fs::metadata(&path)?.len();
+        while !matches!(
+            compact_legacy_step(&mut db, 16)?,
+            CompactStep::Finished { .. }
+        ) {}
+        let callbacks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let interrupt = callbacks.clone();
+        assert!(!reclaim_vacuum(&db, move || interrupt
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            >= 1)?);
+        assert!(callbacks.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        assert_eq!(reclaim_phase(&db)?, ReclaimPhase::Vacuum);
+        assert_eq!(
+            search(&db, "合成空间标记", Scope::Content, &[], &[], || {
+                false
+            })?
+            .len(),
+            80
+        );
+        assert!(reclaim_vacuum(&db, || false)?);
+        assert!(reclaim_checkpoint(&db)?);
+        let after = std::fs::metadata(&path)?.len();
+        assert!(
+            after < before,
+            "synthetic index did not shrink: {before} -> {after}"
+        );
+        assert_eq!(
+            search(&db, "合成空间标记", Scope::Content, &[], &[], || {
+                false
+            })?
+            .len(),
+            80
+        );
+        Ok(())
+    }
+
+    #[test]
     fn exact_matches_union_fields_order_and_reject_false_candidates() -> Result<()> {
         let temp = tempdir()?;
         let mut db = open(&temp.path().join("index.db"))?;
@@ -548,6 +1164,26 @@ mod tests {
             )?,
             0
         );
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_unknown_schema_before_changing_it() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("newer.db");
+        let db = Connection::open(&path)?;
+        db.pragma_update(None, "application_id", APPLICATION_ID)?;
+        db.pragma_update(None, "user_version", 99)?;
+        db.execute("CREATE TABLE preserved(value TEXT)", [])?;
+        drop(db);
+        assert!(open(&path).is_err());
+        let db = Connection::open(&path)?;
+        let unexpected: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('files','terms','retries','scan_issues')", [], |row| row.get(0))?;
+        assert_eq!(unexpected, 0);
+        let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        assert_eq!(version, 99);
+        drop(db);
+        assert!(open_reader(&path).is_err());
         Ok(())
     }
 
