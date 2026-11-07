@@ -495,6 +495,35 @@ impl DeskApp {
                             cloud,
                             scan_errors
                         );
+                    } else if matches!(
+                        message.get("state").and_then(|v| v.as_str()),
+                        Some(
+                            "content_scope"
+                                | "content_scope_complete"
+                                | "content_scope_paused"
+                                | "content_scope_resource_paused"
+                        )
+                    ) {
+                        let state = message.get("state").and_then(|v| v.as_str()).unwrap_or("");
+                        let processed = message
+                            .get("processed")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        self.index_status = if state == "content_scope_complete" {
+                            "正文索引范围已调整，正在准备扫描".into()
+                        } else {
+                            format!(
+                                "正文索引范围调整{}：已处理 {} 个文件",
+                                if state == "content_scope_paused" {
+                                    "（已暂停）"
+                                } else if state == "content_scope_resource_paused" {
+                                    "（系统繁忙，已暂停）"
+                                } else {
+                                    "中"
+                                },
+                                processed
+                            )
+                        };
                     } else if message.get("state").and_then(|v| v.as_str()) == Some("watch_failed")
                     {
                         self.index_status = "部分磁盘无法监听，将通过补扫更新".into();
@@ -703,6 +732,11 @@ impl eframe::App for DeskApp {
             ui.selectable_value(&mut self.scope, Scope::Name, "仅文件名");
             ui.selectable_value(&mut self.scope, Scope::Content, "仅内容");
         });
+        ui.label(
+            RichText::new("正文索引：Word、PowerPoint、Excel、Markdown；其他文件仅搜索名称")
+                .small()
+                .weak(),
+        );
         ui.horizontal_wrapped(|ui| {
             for (i, (_, label)) in TYPES.iter().enumerate() {
                 ui.checkbox(&mut self.kinds[i], *label);
@@ -1549,7 +1583,7 @@ mod tests {
             let settings = Settings::default_for(temporary.path());
             std::fs::create_dir_all(&settings.index_dir)?;
             let mut db = index::open(&settings.index_dir.join("index.db"))?;
-            let fixture = temporary.path().join("synthetic.txt");
+            let fixture = temporary.path().join("synthetic.md");
             std::fs::write(&fixture, "前文合成窗口验证后文")?;
             let record = scanner::metadata_record(&fixture)?;
             let content = llmlocalsearch::text::read_plain(&fixture)?;

@@ -3,7 +3,7 @@ if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hoste
     throw 'Installer smoke test requires an isolated GitHub-hosted runner.'
 }
 $root = Split-Path -Parent $PSScriptRoot
-$installer = Join-Path $root 'dist\LLMLocalSearch-0.1.6-setup.exe'
+$installer = Join-Path $root 'dist\LLMLocalSearch-0.1.7-setup.exe'
 $work = Join-Path $env:RUNNER_TEMP 'llmlocalsearch-installer-smoke'
 $program = Join-Path $work 'program'
 $collision = Join-Path $work 'collision'

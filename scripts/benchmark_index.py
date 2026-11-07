@@ -36,7 +36,7 @@ if json.loads(manifest.read_text(encoding="utf-8")) != {
 paths = [path for path in corpus.rglob("*") if path.is_file()]
 if (
     len(paths) != expected_files
-    or any(path.suffix != ".txt" for path in paths)
+    or any(path.suffix != ".md" for path in paths)
     or sum(path.stat().st_size for path in paths) != expected_bytes
 ):
     raise SystemExit("Synthetic corpus size does not match the fixed 100,000-file workload")

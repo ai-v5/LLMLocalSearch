@@ -29,7 +29,7 @@ def main() -> None:
             raise SystemExit("Synthetic fixture already exists")
         files.mkdir()
         database.parent.mkdir(exist_ok=True)
-        (files / "synthetic.txt").write_text(expected_text, encoding="utf-8")
+        (files / "synthetic.md").write_text(expected_text, encoding="utf-8")
     elif not files.is_dir() or not database.is_file():
         raise SystemExit("Synthetic legacy index is missing")
 
@@ -65,7 +65,7 @@ def main() -> None:
                         ("body_grams:(g5408x6210x7a97x AND g7ax71x)",),
                     ).fetchall()
                 if app_id == 0x4C4C5358 and version == expected_version and rows == [
-                    (1, "synthetic.txt", "indexed", expected_text)
+                    (1, "synthetic.md", "indexed", expected_text)
                 ]:
                     completed = True
                     break

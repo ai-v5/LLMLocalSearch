@@ -4,7 +4,7 @@ if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hoste
 }
 $root = Split-Path -Parent $PSScriptRoot
 $legacy = Join-Path $root '.cache\legacy-source\dist\LLMLocalSearch-0.1.0-setup.exe'
-$current = Join-Path $root 'dist\LLMLocalSearch-0.1.6-setup.exe'
+$current = Join-Path $root 'dist\LLMLocalSearch-0.1.7-setup.exe'
 $work = Join-Path $env:RUNNER_TEMP 'llmlocalsearch-legacy-upgrade'
 $appKey = 'HKCU:\Software\LLMLocalSearch'
 $uninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\LLMLocalSearch'
@@ -91,7 +91,7 @@ $program = Join-Path $scenario 'program'
 $before = Get-Hashes (Get-Preserved $scenario)
 Invoke-Setup $current @('/S', "/D=$program")
 Assert-Hashes $before
-if ((Get-ItemPropertyValue -LiteralPath $uninstallKey -Name DisplayVersion) -ne '0.1.6') {
+if ((Get-ItemPropertyValue -LiteralPath $uninstallKey -Name DisplayVersion) -ne '0.1.7') {
     throw 'Registered upgrade did not install the new version.'
 }
 Invoke-Worker $scenario 'migrate'

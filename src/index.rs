@@ -7,6 +7,10 @@ use std::path::Path;
 const APPLICATION_ID: i64 = 0x4c4c5358;
 const INDEX_SCHEMA_VERSION: i64 = 2;
 
+pub fn supports_content(kind: &str) -> bool {
+    matches!(kind, "markdown" | "word" | "powerpoint" | "excel")
+}
+
 #[derive(Clone, Debug)]
 pub struct FileRecord {
     pub path: String,
@@ -66,6 +70,13 @@ pub enum ReclaimPhase {
     None,
     Vacuum,
     Checkpoint,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentScopeStep {
+    Current,
+    Working { processed: u64 },
+    Finished { processed: u64 },
 }
 
 fn supported_schema(connection: &Connection, allow_empty: bool) -> Result<Option<String>> {
@@ -405,6 +416,122 @@ pub fn abort_legacy_compaction(connection: &mut Connection) -> Result<bool> {
     Ok(true)
 }
 
+/// Remove excluded bodies in restartable transactions while retaining filename search.
+fn content_scope_step(connection: &mut Connection, batch_size: usize) -> Result<ContentScopeStep> {
+    if batch_size == 0 {
+        bail!("正文范围调整批量大小无效");
+    }
+    let limit = i64::try_from(batch_size).context("正文范围调整批量大小无效")?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS content_scope_state(
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL,
+            next_id INTEGER NOT NULL, processed INTEGER NOT NULL, complete INTEGER NOT NULL);",
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO content_scope_state VALUES(1,1,?1,0,0)",
+        [i64::MIN],
+    )?;
+    let (version, next_id, processed, complete): (i64, i64, i64, i64) = tx.query_row(
+        "SELECT version,next_id,processed,complete FROM content_scope_state WHERE singleton=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    if version != 1 || processed < 0 || !matches!(complete, 0 | 1) {
+        bail!("正文范围调整状态无效");
+    }
+    if complete == 1 {
+        tx.commit()?;
+        return Ok(ContentScopeStep::Current);
+    }
+    let rows = {
+        let mut statement = tx.prepare(
+            "SELECT id,name,state,body IS NOT NULL FROM files NOT INDEXED
+             WHERE id>=?1 AND kind NOT IN ('markdown','word','powerpoint','excel')
+             AND (state NOT IN ('name_only','cloud_placeholder') OR body IS NOT NULL)
+             ORDER BY id LIMIT ?2",
+        )?;
+        statement
+            .query_map(params![next_id, limit], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let Some((last_id, _, _, _)) = rows.last() else {
+        tx.execute(
+            "UPDATE content_scope_state SET complete=1 WHERE singleton=1",
+            [],
+        )?;
+        tx.commit()?;
+        return Ok(ContentScopeStep::Finished {
+            processed: processed as u64,
+        });
+    };
+    let next = last_id.checked_add(1);
+    let total = processed
+        .checked_add(rows.len() as i64)
+        .context("正文范围调整计数溢出")?;
+    for (id, name, state, had_body) in rows {
+        if had_body || state == "indexed" {
+            tx.execute("DELETE FROM terms WHERE rowid=?1", [id])?;
+            tx.execute(
+                "INSERT INTO terms(rowid,name_grams,body_grams) VALUES(?1,?2,'')",
+                params![id, query::grams(&name)],
+            )?;
+        }
+        tx.execute("DELETE FROM retries WHERE file_id=?1", [id])?;
+        tx.execute(
+            "UPDATE files SET body=NULL,state=?1 WHERE id=?2",
+            params![
+                if state == "cloud_placeholder" {
+                    "cloud_placeholder"
+                } else {
+                    "name_only"
+                },
+                id
+            ],
+        )?;
+    }
+    tx.execute(
+        "UPDATE content_scope_state SET next_id=?1,processed=?2,complete=?3 WHERE singleton=1",
+        params![next.unwrap_or(i64::MAX), total, i64::from(next.is_none())],
+    )?;
+    tx.commit()?;
+    Ok(if next.is_some() {
+        ContentScopeStep::Working {
+            processed: total as u64,
+        }
+    } else {
+        ContentScopeStep::Finished {
+            processed: total as u64,
+        }
+    })
+}
+
+pub fn interruptible_content_scope_step(
+    connection: &mut Connection,
+    batch_size: usize,
+    cancelled: impl FnMut() -> bool + Send + 'static,
+) -> Result<ContentScopeStep> {
+    if !connection.is_autocommit() {
+        bail!("正文范围调整需要独立事务");
+    }
+    connection.progress_handler(1000, Some(cancelled))?;
+    let result = content_scope_step(connection, batch_size);
+    connection.progress_handler(0, None::<fn() -> bool>)?;
+    // A repeatedly triggered progress handler can interrupt the transaction's
+    // automatic rollback as well. Finish that rollback after disabling it.
+    if !connection.is_autocommit() {
+        connection.execute_batch("ROLLBACK")?;
+    }
+    result
+}
+
 /// Metadata changes invalidate stale content in the same transaction as the FTS update.
 pub fn upsert_metadata(connection: &mut Connection, record: &FileRecord) -> Result<bool> {
     upsert_metadata_inner(connection, record, false).map(|(changed, _)| changed)
@@ -508,7 +635,8 @@ pub fn set_bodies(connection: &mut Connection, updates: &[BodyUpdate]) -> Result
     for (update, body_grams) in updates.iter().zip(encoded) {
         let entry: Option<(i64, String)> = tx
             .query_row(
-                "SELECT id, name FROM files WHERE path=?1 AND modified_ms=?2 AND size=?3",
+                "SELECT id, name FROM files WHERE path=?1 AND modified_ms=?2 AND size=?3
+                 AND kind IN ('markdown','word','powerpoint','excel')",
                 params![update.path, update.modified_ms, update.size as i64],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -721,7 +849,11 @@ pub fn search_stream(
         if !kinds.is_empty() && !kinds.contains(&kind) {
             continue;
         }
-        let body: Option<String> = row.get(7)?;
+        let body: Option<String> = if supports_content(&kind) {
+            row.get(7)?
+        } else {
+            None
+        };
         if !query::matches(&terms, &name, body.as_deref().unwrap_or(""), scope) {
             continue;
         }
@@ -732,6 +864,10 @@ pub fn search_stream(
         } else {
             None
         };
+        let mut state: String = row.get(6)?;
+        if !supports_content(&kind) && state != "cloud_placeholder" {
+            state = "name_only".into();
+        }
         batch.push(SearchHit {
             id: row.get(0)?,
             file: FileRecord {
@@ -740,7 +876,7 @@ pub fn search_stream(
                 kind,
                 modified_ms: row.get(4)?,
                 size: row.get::<_, i64>(5)? as u64,
-                state: row.get(6)?,
+                state,
             },
             name_match,
             snippet: excerpt,
@@ -807,6 +943,205 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn legacy_excluded_bodies_are_not_searchable_but_names_are() -> Result<()> {
+        let temp = tempdir()?;
+        let mut db = open(&temp.path().join("index.db"))?;
+        let old = FileRecord {
+            path: "old.txt".into(),
+            name: "old.txt".into(),
+            kind: "txt".into(),
+            modified_ms: 1,
+            size: 1,
+            state: "pending".into(),
+        };
+        upsert_metadata(&mut db, &old)?;
+        let id: i64 = db.query_row("SELECT id FROM files WHERE path='old.txt'", [], |r| {
+            r.get(0)
+        })?;
+        db.execute(
+            "UPDATE files SET body=?1,state='indexed' WHERE id=?2",
+            params!["旧版正文命中", id],
+        )?;
+        db.execute("DELETE FROM terms WHERE rowid=?1", [id])?;
+        db.execute(
+            "INSERT INTO terms(rowid,name_grams,body_grams) VALUES(?1,?2,?3)",
+            params![id, query::grams(&old.name), query::grams("旧版正文命中")],
+        )?;
+        assert!(
+            search(&db, "旧版正文命中", Scope::Content, &[], &[], || {
+                false
+            })?
+            .is_empty()
+        );
+        assert_eq!(
+            search(&db, "old.txt", Scope::Name, &[], &[], || false)?.len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn content_scope_migration_resumes_and_preserves_names_and_allowed_bodies() -> Result<()> {
+        let temp = tempdir()?;
+        let database = temp.path().join("index.db");
+        let mut db = open(&database)?;
+        for (path, kind, body, state) in [
+            ("old.txt", "txt", Some("旧版正文命中"), "indexed"),
+            ("old.pdf", "pdf", Some("旧版PDF正文"), "indexed"),
+            ("old.json", "other", Some("旧版配置正文"), "name_only"),
+            ("pending.html", "html", None, "pending"),
+            (
+                "cloud.txt",
+                "txt",
+                Some("旧版云端正文"),
+                "cloud_placeholder",
+            ),
+        ] {
+            let record = FileRecord {
+                path: path.into(),
+                name: path.into(),
+                kind: kind.into(),
+                modified_ms: 1,
+                size: 1,
+                state: "pending".into(),
+            };
+            upsert_metadata(&mut db, &record)?;
+            let id: i64 =
+                db.query_row("SELECT id FROM files WHERE path=?1", [path], |r| r.get(0))?;
+            db.execute(
+                "UPDATE files SET body=?1,state=?2 WHERE id=?3",
+                params![body, state, id],
+            )?;
+            db.execute("DELETE FROM terms WHERE rowid=?1", [id])?;
+            db.execute(
+                "INSERT INTO terms(rowid,name_grams,body_grams) VALUES(?1,?2,?3)",
+                params![
+                    id,
+                    query::grams(path),
+                    body.map(query::grams).unwrap_or_default()
+                ],
+            )?;
+            if state == "pending" {
+                db.execute(
+                    "INSERT INTO retries(file_id,attempts,next_ms) VALUES(?1,1,0)",
+                    [id],
+                )?;
+            }
+        }
+        let allowed = FileRecord {
+            path: "keep.md".into(),
+            name: "keep.md".into(),
+            kind: "markdown".into(),
+            modified_ms: 2,
+            size: 1,
+            state: "pending".into(),
+        };
+        upsert_metadata(&mut db, &allowed)?;
+        assert!(set_body(
+            &mut db,
+            "keep.md",
+            2,
+            1,
+            Some("保留Markdown正文"),
+            "indexed"
+        )?);
+        assert!(matches!(
+            content_scope_step(&mut db, 1)?,
+            ContentScopeStep::Working { processed: 1 }
+        ));
+        drop(db);
+        let mut db = open(&database)?;
+        loop {
+            match content_scope_step(&mut db, 2)? {
+                ContentScopeStep::Working { .. } => {}
+                ContentScopeStep::Finished { processed } => {
+                    assert_eq!(processed, 5);
+                    break;
+                }
+                ContentScopeStep::Current => panic!("unfinished content scope was skipped"),
+            }
+        }
+        assert_eq!(content_scope_step(&mut db, 2)?, ContentScopeStep::Current);
+        let excluded_with_bodies: i64 = db.query_row(
+            "SELECT count(*) FROM files WHERE kind NOT IN ('markdown','word','powerpoint','excel') AND body IS NOT NULL", [], |r| r.get(0))?;
+        assert_eq!(excluded_with_bodies, 0);
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM retries", [], |r| r.get::<_, i64>(0))?,
+            0
+        );
+        assert_eq!(
+            db.query_row("SELECT state FROM files WHERE path='cloud.txt'", [], |r| {
+                r.get::<_, String>(0)
+            })?,
+            "cloud_placeholder"
+        );
+        assert_eq!(
+            search(&db, "old.txt", Scope::Name, &[], &[], || false)?.len(),
+            1
+        );
+        assert_eq!(
+            search(&db, "保留Markdown正文", Scope::Content, &[], &[], || false)?.len(),
+            1
+        );
+        let expression = query::fts_expression(&query::parse("旧版正文命中"), Scope::Content);
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM terms WHERE terms MATCH ?1",
+                [expression],
+                |r| r.get::<_, i64>(0)
+            )?,
+            0
+        );
+        assert!(!set_body(
+            &mut db,
+            "old.txt",
+            1,
+            1,
+            Some("不得重新写入"),
+            "indexed"
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn interrupted_content_scope_transaction_can_be_retried() -> Result<()> {
+        let temp = tempdir()?;
+        let mut db = open(&temp.path().join("index.db"))?;
+        {
+            let tx = db.transaction()?;
+            for id in 1..=2000 {
+                tx.execute("INSERT INTO files(id,path,name,kind,modified_ms,size,state) VALUES(?1,?2,?2,'other',1,1,'name_only')",
+                    params![id, format!("synthetic-{id}")])?;
+            }
+            tx.execute("INSERT INTO files(id,path,name,kind,modified_ms,size,state) VALUES(2001,'old.txt','old.txt','txt',1,1,'pending')", [])?;
+            tx.commit()?;
+        }
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let interrupted = interruptible_content_scope_step(&mut db, 16, move || {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 5
+        });
+        assert!(interrupted.is_err());
+        assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 5);
+        assert!(db.is_autocommit());
+        assert_eq!(
+            db.query_row("SELECT state FROM files WHERE id=2001", [], |r| r
+                .get::<_, String>(0))?,
+            "pending"
+        );
+        while matches!(
+            content_scope_step(&mut db, 16)?,
+            ContentScopeStep::Working { .. }
+        ) {}
+        assert_eq!(
+            db.query_row("SELECT state FROM files WHERE id=2001", [], |r| r
+                .get::<_, String>(0))?,
+            "name_only"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn batched_paths_include_boundary_ids_when_rows_are_deleted() -> Result<()> {
         let mut db = Connection::open_in_memory()?;
         db.execute_batch(
@@ -859,7 +1194,7 @@ mod tests {
         FileRecord {
             path: path.into(),
             name: name.into(),
-            kind: "txt".into(),
+            kind: "markdown".into(),
             modified_ms: time,
             size: 1,
             state: "pending".into(),
@@ -897,9 +1232,9 @@ mod tests {
         let temp = tempdir()?;
         let path = temp.path().join("legacy.db");
         let mut db = legacy_index(&path)?;
-        upsert_metadata(&mut db, &record("one", "项目报告.txt", 10))?;
-        upsert_metadata(&mut db, &record("two", "其他.txt", 20))?;
-        upsert_metadata(&mut db, &record("three", "最近.txt", 30))?;
+        upsert_metadata(&mut db, &record("one", "项目报告.md", 10))?;
+        upsert_metadata(&mut db, &record("two", "其他.md", 20))?;
+        upsert_metadata(&mut db, &record("three", "最近.md", 30))?;
         set_body(
             &mut db,
             "one",
@@ -936,7 +1271,7 @@ mod tests {
             }
         );
         assert_eq!(snapshot(&open_reader(&path)?)?, expected);
-        assert!(upsert_metadata(&mut db, &record("new", "new.txt", 40)).is_err());
+        assert!(upsert_metadata(&mut db, &record("new", "new.md", 40)).is_err());
         assert_eq!(stats(&db)?.files, 3);
         drop(db);
 
@@ -967,7 +1302,7 @@ mod tests {
             [], |row| row.get(0),
         )?;
         assert_eq!(content, 0);
-        upsert_metadata(&mut db, &record("new", "new.txt", 40))?;
+        upsert_metadata(&mut db, &record("new", "new.md", 40))?;
         set_body(&mut db, "new", 40, 1, Some("恢复写入"), "indexed")?;
         assert_eq!(
             search(&db, "恢复写入", Scope::Content, &[], &[], || false)?.len(),
@@ -983,7 +1318,7 @@ mod tests {
         let temp = tempdir()?;
         let path = temp.path().join("legacy.db");
         let mut db = legacy_index(&path)?;
-        upsert_metadata(&mut db, &record("one", "one.txt", 10))?;
+        upsert_metadata(&mut db, &record("one", "one.md", 10))?;
         db.execute("DELETE FROM terms", [])?;
         assert!(compact_legacy_step(&mut db, 10).is_err());
         let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -1003,7 +1338,7 @@ mod tests {
         let temp = tempdir()?;
         let path = temp.path().join("legacy.db");
         let mut db = legacy_index(&path)?;
-        for (id, name) in [("one", "一.txt"), ("two", "二.txt"), ("three", "三.txt")] {
+        for (id, name) in [("one", "一.md"), ("two", "二.md"), ("three", "三.md")] {
             upsert_metadata(&mut db, &record(id, name, 1))?;
             set_body(&mut db, id, 1, 1, Some("合成内容"), "indexed")?;
         }
@@ -1033,7 +1368,7 @@ mod tests {
             search(&db, "合成内容", Scope::Content, &[], &[], || false)?.len(),
             3
         );
-        upsert_metadata(&mut db, &record("new", "新.txt", 2))?;
+        upsert_metadata(&mut db, &record("new", "新.md", 2))?;
         assert_eq!(stats(&db)?.files, 4);
         let leftovers: i64 = db.query_row(
             "SELECT count(*) FROM sqlite_master WHERE name IN ('terms_compacting','index_compaction_state','index_compaction_guard_insert','index_compaction_guard_update','index_compaction_guard_delete')",
@@ -1058,7 +1393,7 @@ mod tests {
                 seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
                 body.push(alphabet[((seed >> 32) as usize) % alphabet.len()]);
             }
-            let name = format!("synthetic-{number}.txt");
+            let name = format!("synthetic-{number}.md");
             upsert_metadata(&mut db, &record(&name, &name, number))?;
             set_body(&mut db, &name, number, 1, Some(&body), "indexed")?;
         }
@@ -1090,7 +1425,7 @@ mod tests {
         );
         db.pragma_update(None, "max_page_count", pages + 1000)?;
         assert!(abort_legacy_compaction(&mut db)?);
-        upsert_metadata(&mut db, &record("after", "after.txt", 99))?;
+        upsert_metadata(&mut db, &record("after", "after.md", 99))?;
         assert_eq!(
             search(&db, "after", Scope::Name, &[], &[], || false)?.len(),
             1
@@ -1103,7 +1438,7 @@ mod tests {
         let temp = tempdir()?;
         let path = temp.path().join("legacy.db");
         let mut db = legacy_index(&path)?;
-        upsert_metadata(&mut db, &record("one", "一.txt", 1))?;
+        upsert_metadata(&mut db, &record("one", "一.md", 1))?;
         set_body(&mut db, "one", 1, 1, Some("合成读取"), "indexed")?;
         let reader = open_reader(&path)?;
         reader.execute_batch("BEGIN")?;
@@ -1145,7 +1480,7 @@ mod tests {
                 seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
                 body.push(alphabet[((seed >> 32) as usize) % alphabet.len()]);
             }
-            let name = format!("synthetic-{number}.txt");
+            let name = format!("synthetic-{number}.md");
             upsert_metadata(&mut db, &record(&name, &name, number))?;
             set_body(&mut db, &name, number, 1, Some(&body), "indexed")?;
         }
@@ -1190,9 +1525,9 @@ mod tests {
     fn exact_matches_union_fields_order_and_reject_false_candidates() -> Result<()> {
         let temp = tempdir()?;
         let mut db = open(&temp.path().join("index.db"))?;
-        upsert_metadata(&mut db, &record("p1", "项目报告.txt", 10))?;
-        upsert_metadata(&mut db, &record("p2", "x.txt", 20))?;
-        upsert_metadata(&mut db, &record("p3", "x2.txt", 30))?;
+        upsert_metadata(&mut db, &record("p1", "项目报告.md", 10))?;
+        upsert_metadata(&mut db, &record("p2", "x.md", 20))?;
+        upsert_metadata(&mut db, &record("p3", "x2.md", 30))?;
         set_body(&mut db, "p1", 10, 1, Some("这里有 GPU 加速"), "indexed")?;
         set_body(&mut db, "p2", 20, 1, Some("项目报告 GPU"), "indexed")?;
         set_body(
@@ -1236,9 +1571,9 @@ mod tests {
     fn changed_files_do_not_keep_old_body_and_old_parser_cannot_overwrite() -> Result<()> {
         let temp = tempdir()?;
         let mut db = open(&temp.path().join("index.db"))?;
-        upsert_metadata(&mut db, &record("p", "a.txt", 10))?;
+        upsert_metadata(&mut db, &record("p", "a.md", 10))?;
         set_body(&mut db, "p", 10, 1, Some("旧内容"), "indexed")?;
-        upsert_metadata(&mut db, &record("p", "a.txt", 20))?;
+        upsert_metadata(&mut db, &record("p", "a.md", 20))?;
         assert!(!set_body(&mut db, "p", 10, 1, Some("旧内容"), "indexed")?);
         assert!(search(&db, "旧内容", Scope::Both, &[], &[], || false)?.is_empty());
         remove_path(&mut db, "p")?;
@@ -1298,9 +1633,9 @@ mod tests {
     fn batch_commits_only_matching_file_versions() -> Result<()> {
         let temp = tempdir()?;
         let mut db = open(&temp.path().join("index.db"))?;
-        upsert_metadata(&mut db, &record("a", "a.txt", 1))?;
-        upsert_metadata(&mut db, &record("b", "b.txt", 2))?;
-        upsert_metadata(&mut db, &record("b", "b.txt", 3))?;
+        upsert_metadata(&mut db, &record("a", "a.md", 1))?;
+        upsert_metadata(&mut db, &record("b", "b.md", 2))?;
+        upsert_metadata(&mut db, &record("b", "b.md", 3))?;
         let updates = vec![
             BodyUpdate {
                 path: "a".into(),

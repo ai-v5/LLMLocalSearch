@@ -52,7 +52,7 @@ fn is_cloud_placeholder(metadata: &fs::Metadata) -> bool {
 fn content_state(file_kind: &str, is_link: bool, attributes: u32, cloud: bool) -> &'static str {
     if cloud {
         "cloud_placeholder"
-    } else if is_link || attributes & 0x400 != 0 || file_kind == "other" {
+    } else if is_link || attributes & 0x400 != 0 || !index::supports_content(file_kind) {
         "name_only"
     } else {
         "pending"
@@ -311,6 +311,41 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn content_scope_is_only_office_and_markdown() {
+        for name in [
+            "a.doc",
+            "a.docx",
+            "a.ppt",
+            "a.pptx",
+            "a.xls",
+            "a.xlsx",
+            "a.md",
+            "a.markdown",
+        ] {
+            assert_eq!(
+                content_state(kind(Path::new(name)), false, 0, false),
+                "pending",
+                "{name}"
+            );
+        }
+        for name in [
+            "a.txt",
+            "a.html",
+            "a.pdf",
+            "a.py",
+            "a.json",
+            "a.yaml",
+            "noextension",
+        ] {
+            assert_eq!(
+                content_state(kind(Path::new(name)), false, 0, false),
+                "name_only",
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn links_and_cloud_placeholders_are_not_queued_for_content() {
         assert_eq!(content_state("txt", true, 0, false), "name_only");
         assert_eq!(content_state("word", false, 0x400, false), "name_only");
@@ -318,7 +353,8 @@ mod tests {
             content_state("txt", false, 0x400, true),
             "cloud_placeholder"
         );
-        assert_eq!(content_state("txt", false, 0, false), "pending");
+        assert_eq!(content_state("txt", false, 0, false), "name_only");
+        assert_eq!(content_state("markdown", false, 0, false), "pending");
     }
 
     #[test]
