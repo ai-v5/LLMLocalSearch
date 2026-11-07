@@ -1,5 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod storage;
 mod worker_client;
 
 use eframe::egui::{self, Color32, RichText};
@@ -71,6 +72,7 @@ struct DeskApp {
     searching: bool,
     status: String,
     index_status: String,
+    storage: storage::StorageMonitor,
     legacy_warning: bool,
     reclaim_warning: bool,
     paused: bool,
@@ -174,6 +176,7 @@ impl DeskApp {
             searching: false,
             status: "输入关键词后开始搜索".into(),
             index_status: "正在启动索引…".into(),
+            storage: storage::StorageMonitor::new(),
             legacy_warning: false,
             reclaim_warning: false,
             paused: false,
@@ -627,6 +630,7 @@ impl DeskApp {
                 Err(e) => self.status = e,
             }
         }
+        self.storage.poll(&self.settings.index_dir, ctx);
         if self.quit
             && self.migrate_wait.is_none()
             && !self.migration_inflight
@@ -675,6 +679,7 @@ impl eframe::App for DeskApp {
             }
         });
         ui.label(RichText::new(&self.index_status).small().weak());
+        ui.label(RichText::new(self.storage.label()).small().weak());
         if ui.small_button("查看索引异常").clicked() {
             self.load_issues(&ctx);
         }
@@ -1321,6 +1326,7 @@ mod tests {
             searching: false,
             status: String::new(),
             index_status: String::new(),
+            storage: storage::StorageMonitor::new(),
             legacy_warning: false,
             reclaim_warning: false,
             paused: false,
