@@ -179,9 +179,10 @@ pub fn scan_root_with_progress(
             Ok(entry) if entry.file_type().is_file() || entry.file_type().is_symlink() => {
                 match metadata_record(entry.path()) {
                     Ok(record) => {
-                        seen.insert(record.path.clone());
+                        let (changed, id) = index::upsert_metadata_with_id(connection, &record)?;
+                        seen.insert(id);
                         stats.discovered += 1;
-                        if index::upsert_metadata(connection, &record)? {
+                        if changed {
                             stats.changed += 1;
                         }
                     }
@@ -221,15 +222,18 @@ pub fn scan_root_with_progress(
         stats.root_unavailable = true;
     }
     if completed && !stats.root_unavailable {
-        let previous_issues = {
-            let mut stmt = connection.prepare("SELECT path FROM scan_issues")?;
-            stmt.query_map([], |r| r.get::<_, String>(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        };
         let tx = connection.transaction()?;
-        for path in previous_issues {
-            if crate::paths::within(Path::new(&path), root) {
-                tx.execute("DELETE FROM scan_issues WHERE path=?1", [&path])?;
+        let mut next_issue = Some(i64::MIN);
+        while let Some(next_id) = next_issue {
+            let batch = index::path_batch(&tx, index::PathTable::ScanIssues, next_id)?;
+            let Some((last_id, _)) = batch.last() else {
+                break;
+            };
+            next_issue = last_id.checked_add(1);
+            for (_, path) in batch {
+                if crate::paths::within(Path::new(&path), root) {
+                    tx.execute("DELETE FROM scan_issues WHERE path=?1", [&path])?;
+                }
             }
         }
         for path in &issues {
@@ -239,39 +243,40 @@ pub fn scan_root_with_progress(
             )?;
         }
         tx.commit()?;
-        let paths = {
-            let mut stmt = connection.prepare("SELECT path FROM files")?;
-            stmt.query_map([], |row| row.get::<_, String>(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        for path in paths {
-            if cancelled() {
-                break;
-            }
-            let p = Path::new(&path);
-            if !crate::paths::within(p, root)
-                || seen.contains(&path)
-                || exclusions.iter().any(|e| crate::paths::within(p, e))
-                || issues
-                    .iter()
-                    .any(|issue| crate::paths::within(p, Path::new(issue)))
-            {
-                continue;
-            }
-            if !root.is_dir() {
-                stats.root_unavailable = true;
-                break;
-            }
-            // Only a confirmed missing file on an online root is removed. Access denied is retained.
-            if fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
-                if root.is_dir() {
-                    index::remove_path(connection, &path)?;
-                } else {
-                    stats.root_unavailable = true;
-                    break;
+        index::visit_paths(
+            connection,
+            index::PathTable::Files,
+            |connection, id, path| {
+                if cancelled() {
+                    return Ok(false);
                 }
-            }
-        }
+                let p = Path::new(path);
+                if !crate::paths::within(p, root)
+                    || seen.contains(&id)
+                    || exclusions.iter().any(|e| crate::paths::within(p, e))
+                    || issues
+                        .iter()
+                        .any(|issue| crate::paths::within(p, Path::new(issue)))
+                {
+                    return Ok(true);
+                }
+                if !root.is_dir() {
+                    stats.root_unavailable = true;
+                    return Ok(false);
+                }
+                // Only a confirmed missing file on an online root is removed. Access denied is retained.
+                if fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                {
+                    if root.is_dir() {
+                        index::remove_path(connection, path)?;
+                    } else {
+                        stats.root_unavailable = true;
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            },
+        )?;
     }
     if !root.is_dir() {
         stats.root_unavailable = true;
@@ -336,6 +341,63 @@ mod tests {
         let offline_scan = scan_root(&mut db, &root, &[], || false)?;
         assert!(offline_scan.root_unavailable);
         assert_eq!(index::stats(&db)?.files, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn scan_reconciles_batched_missing_files_and_issue_paths() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("files");
+        let excluded = root.join("excluded");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&root)?;
+        let existing = root.join("existing.txt");
+        fs::write(&existing, "合成正文")?;
+        let mut db = index::open(&temp.path().join("index.db"))?;
+        let existing_record = metadata_record(&existing)?;
+        let (changed, id) = index::upsert_metadata_with_id(&mut db, &existing_record)?;
+        assert!(changed);
+        assert_eq!(
+            index::upsert_metadata_with_id(&mut db, &existing_record)?,
+            (false, id)
+        );
+        for number in 0..600 {
+            let parent = match number % 3 {
+                0 => &root,
+                1 => &excluded,
+                _ => &outside,
+            };
+            let name = format!("synthetic-{number}.txt");
+            let path = parent.join(&name).to_string_lossy().into_owned();
+            index::upsert_metadata(
+                &mut db,
+                &FileRecord {
+                    path: path.clone(),
+                    name,
+                    kind: "txt".into(),
+                    modified_ms: number,
+                    size: 0,
+                    state: "pending".into(),
+                },
+            )?;
+            db.execute(
+                "INSERT INTO scan_issues(path,category) VALUES(?1,'inaccessible')",
+                [&path],
+            )?;
+        }
+        scan_root(&mut db, &root, std::slice::from_ref(&excluded), || false)?;
+        assert_eq!(index::stats(&db)?.files, 401);
+        assert_eq!(index::stats(&db)?.scan_errors, 200);
+        let mut statement = db.prepare("SELECT path FROM files")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            let path = row?;
+            assert!(
+                path == existing_record.path
+                    || crate::paths::within(Path::new(&path), &excluded)
+                    || crate::paths::within(Path::new(&path), &outside)
+            );
+        }
         Ok(())
     }
 

@@ -395,26 +395,26 @@ fn flush_batch(connection: &mut Connection, batch: &mut Vec<index::BodyUpdate>) 
 }
 
 fn remove_missing(connection: &mut Connection, missing: &Path) -> Result<()> {
-    let paths = {
-        let mut stmt = connection.prepare("SELECT path FROM files")?;
-        stmt.query_map([], |row| row.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-    };
-    for path in paths {
-        if paths::within(Path::new(&path), missing) {
-            index::remove_path(connection, &path)?;
-        }
-    }
-    let issues = {
-        let mut stmt = connection.prepare("SELECT path FROM scan_issues")?;
-        stmt.query_map([], |r| r.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-    };
-    for path in issues {
-        if paths::within(Path::new(&path), missing) {
-            connection.execute("DELETE FROM scan_issues WHERE path=?1", [&path])?;
-        }
-    }
+    index::visit_paths(
+        connection,
+        index::PathTable::Files,
+        |connection, _, path| {
+            if paths::within(Path::new(path), missing) {
+                index::remove_path(connection, path)?;
+            }
+            Ok(true)
+        },
+    )?;
+    index::visit_paths(
+        connection,
+        index::PathTable::ScanIssues,
+        |connection, _, path| {
+            if paths::within(Path::new(path), missing) {
+                connection.execute("DELETE FROM scan_issues WHERE path=?1", [path])?;
+            }
+            Ok(true)
+        },
+    )?;
     Ok(())
 }
 
@@ -765,6 +765,155 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Run separately from the regular suite: it creates a large synthetic database.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn large_index_cleanup_fits_memory_limit() -> Result<()> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::*;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        const CHILD_DB: &str = "LLMLOCAL_TEST_BOUNDED_DB";
+        const CHILD_ROOT: &str = "LLMLOCAL_TEST_BOUNDED_ROOT";
+        if let Some(database) = std::env::var_os(CHILD_DB) {
+            let root = PathBuf::from(std::env::var_os(CHILD_ROOT).context("missing test root")?);
+            unsafe {
+                let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                anyhow::ensure!(!job.is_null(), "failed to create test job");
+                let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+                limits.ProcessMemoryLimit = 96 * 1024 * 1024;
+                anyhow::ensure!(
+                    SetInformationJobObject(
+                        job,
+                        JobObjectExtendedLimitInformation,
+                        &limits as *const _ as *const _,
+                        std::mem::size_of_val(&limits) as u32,
+                    ) != 0,
+                    "failed to set test memory limit"
+                );
+                anyhow::ensure!(
+                    AssignProcessToJobObject(job, GetCurrentProcess()) != 0,
+                    "failed to apply test memory limit"
+                );
+                // Simulate the scanner's set of visited IDs while reconciling paths.
+                let count = std::env::var("LLMLOCAL_TEST_PATH_COUNT")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(400_000);
+                let seen: std::collections::HashSet<i64> =
+                    (0..count).map(|value| value as i64).collect();
+                let mut connection = Connection::open(database)?;
+                remove_missing(&mut connection, &root.join("excluded"))?;
+                eprintln!("synthetic startup cleanup completed");
+                scanner::scan_root(&mut connection, &root, &[], || false)?;
+                assert_eq!(seen.len(), count);
+                let mut peak: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                anyhow::ensure!(
+                    QueryInformationJobObject(
+                        job,
+                        JobObjectExtendedLimitInformation,
+                        &mut peak as *mut _ as *mut _,
+                        std::mem::size_of_val(&peak) as u32,
+                        std::ptr::null_mut(),
+                    ) != 0,
+                    "failed to read test memory usage"
+                );
+                eprintln!(
+                    "synthetic job-accounted peak after assignment: {} bytes",
+                    peak.PeakProcessMemoryUsed
+                );
+                CloseHandle(job);
+            }
+            return Ok(());
+        }
+
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("empty-root");
+        std::fs::create_dir(&root)?;
+        let database = temporary.path().join("synthetic.db");
+        let mut connection = Connection::open(&database)?;
+        connection.execute_batch(
+            "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;
+             CREATE TABLE files(id INTEGER PRIMARY KEY,path TEXT NOT NULL);
+             CREATE TABLE scan_issues(path TEXT PRIMARY KEY,category TEXT NOT NULL);",
+        )?;
+        let count = std::env::var("LLMLOCAL_TEST_PATH_COUNT")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(400_000);
+        let padding = "s".repeat(
+            std::env::var("LLMLOCAL_TEST_PATH_PADDING")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(240),
+        );
+        let tx = connection.transaction()?;
+        {
+            let mut statement = tx.prepare("INSERT INTO files(path) VALUES(?1)")?;
+            for number in 0..count {
+                let path = format!(r"S:\synthetic-outside\{number:08}\{padding}.txt");
+                statement.execute([path])?;
+            }
+        }
+        tx.commit()?;
+        drop(connection);
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "tests::large_index_cleanup_fits_memory_limit",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(CHILD_DB, &database)
+            .env(CHILD_ROOT, &root)
+            .status()?;
+        anyhow::ensure!(status.success(), "bounded cleanup child failed: {status}");
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_removes_only_the_requested_subtree_across_batches() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let removed = temporary.path().join("synthetic");
+        let retained = temporary.path().join("synthetic-sibling");
+        let mut db = index::open(&temporary.path().join("index.db"))?;
+        for number in 0..600 {
+            let directory = if number % 2 == 0 { &removed } else { &retained };
+            let name = format!("synthetic-{number}.txt");
+            let path = directory.join(&name).to_string_lossy().into_owned();
+            index::upsert_metadata(
+                &mut db,
+                &index::FileRecord {
+                    path: path.clone(),
+                    name,
+                    kind: "txt".into(),
+                    modified_ms: number,
+                    size: 0,
+                    state: "pending".into(),
+                },
+            )?;
+            db.execute(
+                "INSERT INTO scan_issues(path,category) VALUES(?1,'inaccessible')",
+                [&path],
+            )?;
+        }
+        remove_missing(&mut db, &removed)?;
+        assert_eq!(index::stats(&db)?.files, 300);
+        assert_eq!(index::stats(&db)?.scan_errors, 300);
+        for table in ["files", "scan_issues"] {
+            let mut statement = db.prepare(&format!("SELECT path FROM {table}"))?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            for path in rows {
+                assert!(paths::within(Path::new(&path?), &retained));
+            }
+        }
+        let terms: i64 = db.query_row("SELECT count(*) FROM terms", [], |row| row.get(0))?;
+        assert_eq!(terms, 300);
+        Ok(())
+    }
 
     #[test]
     fn delayed_rename_event_does_not_remove_an_offline_root_file() -> Result<()> {

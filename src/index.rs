@@ -407,19 +407,26 @@ pub fn abort_legacy_compaction(connection: &mut Connection) -> Result<bool> {
 
 /// Metadata changes invalidate stale content in the same transaction as the FTS update.
 pub fn upsert_metadata(connection: &mut Connection, record: &FileRecord) -> Result<bool> {
+    upsert_metadata_inner(connection, record, false).map(|(changed, _)| changed)
+}
+
+pub(crate) fn upsert_metadata_with_id(
+    connection: &mut Connection,
+    record: &FileRecord,
+) -> Result<(bool, i64)> {
     upsert_metadata_inner(connection, record, false)
 }
 
 /// A watcher event can signal a write even when size and mtime were preserved.
 pub fn invalidate_metadata(connection: &mut Connection, record: &FileRecord) -> Result<bool> {
-    upsert_metadata_inner(connection, record, true)
+    upsert_metadata_inner(connection, record, true).map(|(changed, _)| changed)
 }
 
 fn upsert_metadata_inner(
     connection: &mut Connection,
     record: &FileRecord,
     force: bool,
-) -> Result<bool> {
+) -> Result<(bool, i64)> {
     let tx = connection.transaction()?;
     let previous: Option<(i64, i64, i64, String, String)> = tx
         .query_row(
@@ -428,7 +435,7 @@ fn upsert_metadata_inner(
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?;
-    if let Some((_, modified, size, ref name, ref state)) = previous
+    if let Some((id, modified, size, ref name, ref state)) = previous
         && !force
         && modified == record.modified_ms
         && size == record.size as i64
@@ -443,7 +450,7 @@ fn upsert_metadata_inner(
         )
     {
         tx.commit()?;
-        return Ok(false);
+        return Ok((false, id));
     }
     tx.execute(
         "INSERT INTO files(path,name,kind,modified_ms,size,state,body)
@@ -469,7 +476,7 @@ fn upsert_metadata_inner(
         params![id, query::grams(&record.name)],
     )?;
     tx.commit()?;
-    Ok(true)
+    Ok((true, id))
 }
 
 /// Apply extraction only if the metadata still corresponds to the parsed version.
@@ -560,6 +567,57 @@ pub fn schedule_retry(
     tx.execute("INSERT INTO retries(file_id,attempts,next_ms) VALUES(?1,?2,?3) ON CONFLICT(file_id) DO UPDATE SET attempts=excluded.attempts,next_ms=excluded.next_ms", params![id, attempts, now.saturating_add(delay_ms)])?;
     tx.commit()?;
     Ok(true)
+}
+
+#[derive(Clone, Copy)]
+pub enum PathTable {
+    Files,
+    ScanIssues,
+}
+
+pub fn path_batch(
+    connection: &Connection,
+    table: PathTable,
+    next_id: i64,
+) -> Result<Vec<(i64, String)>> {
+    const BATCH_SIZE: i64 = 256;
+    let sql = match table {
+        PathTable::Files => "SELECT id,path FROM files WHERE id>=?1 ORDER BY id LIMIT ?2",
+        PathTable::ScanIssues => {
+            "SELECT rowid,path FROM scan_issues WHERE rowid>=?1 ORDER BY rowid LIMIT ?2"
+        }
+    };
+    let mut statement = connection.prepare(sql)?;
+    let paths = statement
+        .query_map([next_id, BATCH_SIZE], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(paths)
+}
+
+/// Visit stable row IDs in small batches so callers can modify the table between reads.
+pub fn visit_paths(
+    connection: &mut Connection,
+    table: PathTable,
+    mut visit: impl FnMut(&mut Connection, i64, &str) -> Result<bool>,
+) -> Result<()> {
+    let mut next_id = i64::MIN;
+    loop {
+        let batch = path_batch(connection, table, next_id)?;
+        let Some(next) = batch.last().map(|(id, _)| id.checked_add(1)) else {
+            return Ok(());
+        };
+        for (id, path) in batch {
+            if !visit(connection, id, &path)? {
+                return Ok(());
+            }
+        }
+        match next {
+            Some(id) => next_id = id,
+            None => return Ok(()),
+        }
+    }
 }
 
 pub fn remove_path(connection: &mut Connection, path: &str) -> Result<()> {
@@ -747,6 +805,55 @@ pub fn snippet(value: &str, terms: &[String]) -> Option<Snippet> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn batched_paths_include_boundary_ids_when_rows_are_deleted() -> Result<()> {
+        let mut db = Connection::open_in_memory()?;
+        db.execute_batch(
+            "CREATE TABLE files(id INTEGER PRIMARY KEY,path TEXT NOT NULL);
+             CREATE TABLE scan_issues(path TEXT PRIMARY KEY,category TEXT NOT NULL);",
+        )?;
+        let mut expected = vec![i64::MIN, -1];
+        expected.extend(0..600);
+        expected.push(i64::MAX);
+        for id in &expected {
+            db.execute(
+                "INSERT INTO files(id,path) VALUES(?1,?2)",
+                params![id, id.to_string()],
+            )?;
+        }
+        let mut visited = Vec::new();
+        visit_paths(&mut db, PathTable::Files, |db, id, _| {
+            visited.push(id);
+            db.execute("DELETE FROM files WHERE id=?1", [id])?;
+            Ok(true)
+        })?;
+        assert_eq!(visited, expected);
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM files", [], |r| r.get::<_, i64>(0))?,
+            0
+        );
+
+        for id in 1..=600 {
+            db.execute(
+                "INSERT INTO scan_issues(rowid,path,category) VALUES(?1,?2,'inaccessible')",
+                params![id, id.to_string()],
+            )?;
+        }
+        let mut count = 0;
+        visit_paths(&mut db, PathTable::ScanIssues, |db, id, _| {
+            count += 1;
+            db.execute("DELETE FROM scan_issues WHERE rowid=?1", [id])?;
+            Ok(true)
+        })?;
+        assert_eq!(count, 600);
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM scan_issues", [], |r| r
+                .get::<_, i64>(0))?,
+            0
+        );
+        Ok(())
+    }
 
     fn record(path: &str, name: &str, time: i64) -> FileRecord {
         FileRecord {

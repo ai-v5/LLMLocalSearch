@@ -250,7 +250,11 @@ fn restarting_a_paused_worker_keeps_indexing_paused() -> Result<()> {
         true,
         eframe::egui::Context::default(),
     )?;
-    wait_until("worker database", || database.exists())?;
+    wait_until("initialized worker database", || {
+        index::open_reader(&database)
+            .and_then(|connection| index::stats(&connection))
+            .is_ok()
+    })?;
     assert!(worker.running());
     std::thread::sleep(Duration::from_secs(2));
     let connection = index::open_reader(&database)?;
