@@ -388,6 +388,7 @@ impl DeskApp {
         while let Ok(event) = self.tray_events.try_recv() {
             if event == "__open__" || event == self.open_id.0 {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             } else if event == self.pause_id.0 {
                 self.paused = true;
@@ -1499,22 +1500,30 @@ mod tests {
         let (tray_tx, tray_rx) = mpsc::channel();
         app.tray_events = tray_rx;
         let ctx = egui::Context::default();
-        tray_tx.send("__open__".into())?;
-        let output = ctx.run_logic(&egui::RawInput::default(), |ctx| app.poll(ctx));
-        assert!(
-            output
-                .viewport_commands
-                .values()
-                .flatten()
-                .any(|command| { matches!(command, egui::ViewportCommand::Visible(true)) })
-        );
-        assert!(
-            output
-                .viewport_commands
-                .values()
-                .flatten()
-                .any(|command| { matches!(command, egui::ViewportCommand::Focus) })
-        );
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .minimized = Some(true);
+        for event in ["__open__".to_owned(), app.open_id.0.clone()] {
+            tray_tx.send(event)?;
+            let output = ctx.run_logic(&input, |ctx| app.poll(ctx));
+            let commands: Vec<_> = output.viewport_commands.values().flatten().collect();
+            let visible = commands
+                .iter()
+                .position(|command| matches!(command, egui::ViewportCommand::Visible(true)))
+                .expect("show window");
+            let restored = commands
+                .iter()
+                .position(|command| matches!(command, egui::ViewportCommand::Minimized(false)))
+                .expect("restore minimized window");
+            let focus = commands
+                .iter()
+                .position(|command| matches!(command, egui::ViewportCommand::Focus))
+                .expect("focus window");
+            assert!(visible < restored && restored < focus);
+        }
         tray_tx.send(app.pause_id.0.clone())?;
         app.poll(&ctx);
         assert!(app.paused);
@@ -1526,26 +1535,25 @@ mod tests {
 
     #[test]
     fn chinese_ime_commit_searches_at_multiple_dpi_scales() -> anyhow::Result<()> {
-        for scale in [1.0, 1.25, 1.5, 2.0] {
+        for (scale, click_button) in [1.0, 1.25, 1.5, 2.0, 2.5]
+            .into_iter()
+            .flat_map(|scale| [(scale, false), (scale, true)])
+        {
             let temporary = tempfile::tempdir()?;
             let settings = Settings::default_for(temporary.path());
             std::fs::create_dir_all(&settings.index_dir)?;
             let mut db = index::open(&settings.index_dir.join("index.db"))?;
-            let record = index::FileRecord {
-                path: "synthetic.txt".into(),
-                name: "合成文档.txt".into(),
-                kind: "txt".into(),
-                modified_ms: 1,
-                size: 1,
-                state: "pending".into(),
-            };
+            let fixture = temporary.path().join("synthetic.txt");
+            std::fs::write(&fixture, "前文合成窗口验证后文")?;
+            let record = scanner::metadata_record(&fixture)?;
+            let content = llmlocalsearch::text::read_plain(&fixture)?;
             index::upsert_metadata(&mut db, &record)?;
             index::set_body(
                 &mut db,
                 &record.path,
-                1,
-                1,
-                Some("前文中文检索后文"),
+                record.modified_ms,
+                record.size,
+                Some(&content),
                 "indexed",
             )?;
             drop(db);
@@ -1585,19 +1593,47 @@ mod tests {
                 ctx.run_ui(preedit, |ui| eframe::App::ui(&mut app, ui, &mut frame));
             composition.textures_delta.clear();
             let mut commit = input.clone();
-            commit
-                .events
-                .push(egui::Event::Ime(egui::ImeEvent::Commit("中文检索".into())));
+            commit.events.push(egui::Event::Ime(egui::ImeEvent::Commit(
+                "合成窗口验证".into(),
+            )));
             let mut output = ctx.run_ui(commit, |ui| eframe::App::ui(&mut app, ui, &mut frame));
             output.textures_delta.clear();
-            assert_eq!(app.query, "中文检索");
+            assert_eq!(app.query, "合成窗口验证");
             assert!((output.pixels_per_point - scale).abs() < 0.01);
             let response = ctx.read_response(field).expect("search field rendered");
             let bounds = input.screen_rect.expect("test bounds");
             assert!(bounds.contains_rect(response.rect));
             let _ = ctx.tessellate(output.shapes, output.pixels_per_point);
 
-            app.start_search(&ctx);
+            if click_button {
+                // The button follows the input in the same horizontal row.
+                let pos = egui::pos2(response.rect.right() + 18.0, response.rect.center().y);
+                for pressed in [true, false] {
+                    let mut pointer = input.clone();
+                    pointer.events.push(egui::Event::PointerMoved(pos));
+                    pointer.events.push(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                    let mut output =
+                        ctx.run_ui(pointer, |ui| eframe::App::ui(&mut app, ui, &mut frame));
+                    output.textures_delta.clear();
+                }
+            } else {
+                let mut enter = input.clone();
+                enter.events.push(egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                let mut output = ctx.run_ui(enter, |ui| eframe::App::ui(&mut app, ui, &mut frame));
+                output.textures_delta.clear();
+            }
+            assert!(app.searching, "search was not submitted at {scale}x");
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while app.searching && std::time::Instant::now() < deadline {
                 app.poll(&ctx);
@@ -1608,7 +1644,7 @@ mod tests {
             let snippet = app.result[0].snippet.as_ref().expect("content snippet");
             assert_eq!(
                 &snippet.text[snippet.hit_start..snippet.hit_end],
-                "中文检索"
+                "合成窗口验证"
             );
         }
         Ok(())
