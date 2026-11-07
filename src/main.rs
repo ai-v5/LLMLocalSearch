@@ -8,7 +8,7 @@ use llmlocalsearch::{
     index::{self, SearchHit},
     query::Scope,
     scanner,
-    settings::{self, Settings},
+    settings::{self, Settings, ThemePreference},
 };
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -32,6 +32,7 @@ const TYPES: [(&str, &str); 8] = [
     ("pdf", "PDF"),
     ("other", "其他文件"),
 ];
+const SEARCH_CHANNEL_BATCHES: usize = 4;
 
 enum SearchEvent {
     Batch(Vec<SearchHit>),
@@ -67,7 +68,7 @@ struct DeskApp {
     page: usize,
     generation: Arc<AtomicU64>,
     active_searches: Arc<AtomicUsize>,
-    search_tx: mpsc::Sender<SearchReply>,
+    search_tx: mpsc::SyncSender<SearchReply>,
     search_rx: mpsc::Receiver<SearchReply>,
     searching: bool,
     status: String,
@@ -105,6 +106,7 @@ impl DeskApp {
         dynamic_fixed: bool,
     ) -> Self {
         setup_fonts(&cc.egui_ctx);
+        apply_theme(&cc.egui_ctx, settings.theme);
         let (event_tx, event_rx) = mpsc::channel();
         let open = MenuItem::new("打开 LLMLocalSearch", true, None);
         let pause = MenuItem::new("暂停索引", true, None);
@@ -146,7 +148,7 @@ impl DeskApp {
                     .build()
                     .ok()
             });
-        let (search_tx, search_rx) = mpsc::channel();
+        let (search_tx, search_rx) = mpsc::sync_channel(SEARCH_CHANNEL_BATCHES);
         let (migration_tx, migration_rx) = mpsc::channel();
         let (cleanup_tx, cleanup_rx) = mpsc::channel();
         let (issue_tx, issue_rx) = mpsc::channel();
@@ -203,6 +205,21 @@ impl DeskApp {
 
     fn database(&self) -> PathBuf {
         self.settings.index_dir.join("index.db")
+    }
+
+    fn choose_theme(&mut self, theme: ThemePreference, ctx: &egui::Context) {
+        if theme == self.settings.theme {
+            return;
+        }
+        let previous = self.settings.theme;
+        self.settings.theme = theme;
+        if settings::save(&self.settings_path, &self.settings).is_err() {
+            self.settings.theme = previous;
+            self.status = "保存主题设置失败".into();
+        } else {
+            apply_theme(ctx, theme);
+            ctx.request_repaint();
+        }
     }
 
     fn effective_exclusions(&self) -> Vec<PathBuf> {
@@ -412,7 +429,12 @@ impl DeskApp {
                 }
             }
         }
-        while let Ok(reply) = self.search_rx.try_recv() {
+        let mut processed = 0;
+        while processed < SEARCH_CHANNEL_BATCHES {
+            let Ok(reply) = self.search_rx.try_recv() else {
+                break;
+            };
+            processed += 1;
             if reply.generation != self.generation.load(Ordering::SeqCst) {
                 continue;
             }
@@ -435,6 +457,9 @@ impl DeskApp {
                     }
                 }
             }
+        }
+        if processed == SEARCH_CHANNEL_BATCHES {
+            ctx.request_repaint();
         }
         if let Some(worker) = &mut self.worker {
             while let Ok(message) = worker.messages.try_recv() {
@@ -700,13 +725,19 @@ impl eframe::App for DeskApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
+        let mut theme = self.settings.theme;
+        ui.horizontal_wrapped(|ui| {
             ui.heading("LLMLocalSearch");
             ui.label(RichText::new("本地离线搜索").weak());
             if ui.button("设置").clicked() {
                 self.show_settings = true;
             }
+            ui.label("主题：");
+            ui.selectable_value(&mut theme, ThemePreference::System, "跟随系统");
+            ui.selectable_value(&mut theme, ThemePreference::Light, "明亮");
+            ui.selectable_value(&mut theme, ThemePreference::Dark, "暗黑");
         });
+        self.choose_theme(theme, &ctx);
         ui.label(RichText::new(&self.index_status).small().weak());
         ui.label(RichText::new(self.storage.label()).small().weak());
         if ui.small_button("查看索引异常").clicked() {
@@ -786,7 +817,7 @@ impl eframe::App for DeskApp {
                         ui.horizontal(|ui| {
                             let title = if hit.name_match {
                                 RichText::new(&hit.file.name)
-                                    .color(Color32::from_rgb(25, 150, 133))
+                                    .color(ui.visuals().hyperlink_color)
                                     .strong()
                             } else {
                                 RichText::new(&hit.file.name).strong()
@@ -803,6 +834,20 @@ impl eframe::App for DeskApp {
                                     })
                                     .unwrap_or_default();
                             ui.label(RichText::new(when).weak());
+                            if hit.total_terms > 1 {
+                                ui.label(
+                                    RichText::new(if hit.matched_terms == hit.total_terms {
+                                        "全部命中".to_owned()
+                                    } else {
+                                        format!(
+                                            "部分命中 {}/{}",
+                                            hit.matched_terms, hit.total_terms
+                                        )
+                                    })
+                                    .small()
+                                    .weak(),
+                                );
+                            }
                             if ui.small_button("所在目录").clicked() {
                                 reveal_file(Path::new(&hit.file.path));
                             }
@@ -1119,6 +1164,14 @@ fn state_label(value: &str) -> &'static str {
     }
 }
 
+fn apply_theme(ctx: &egui::Context, theme: ThemePreference) {
+    ctx.set_theme(match theme {
+        ThemePreference::System => egui::ThemePreference::System,
+        ThemePreference::Light => egui::ThemePreference::Light,
+        ThemePreference::Dark => egui::ThemePreference::Dark,
+    });
+}
+
 fn setup_fonts(ctx: &egui::Context) {
     if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\msyh.ttc") {
         let mut fonts = egui::FontDefinitions::default();
@@ -1330,7 +1383,7 @@ mod tests {
 
     fn app_for_test(directory: &Path, settings: Settings) -> DeskApp {
         let (_, tray_events) = mpsc::channel();
-        let (search_tx, search_rx) = mpsc::channel();
+        let (search_tx, search_rx) = mpsc::sync_channel(SEARCH_CHANNEL_BATCHES);
         let (migration_tx, migration_rx) = mpsc::channel();
         let (cleanup_tx, cleanup_rx) = mpsc::channel();
         let (issue_tx, issue_rx) = mpsc::channel();
@@ -1381,6 +1434,236 @@ mod tests {
             issue_tx,
             issue_rx,
         }
+    }
+
+    #[test]
+    fn theme_switch_applies_and_persists_without_changing_existing_settings() -> anyhow::Result<()>
+    {
+        let temporary = tempfile::tempdir()?;
+        let mut settings = Settings::default_for(temporary.path());
+        settings
+            .exclusions
+            .push(temporary.path().join("synthetic-excluded"));
+        settings.autostart = true;
+        let mut app = app_for_test(temporary.path(), settings.clone());
+        let ctx = egui::Context::default();
+        app.choose_theme(ThemePreference::Light, &ctx);
+        assert_eq!(ctx.theme(), egui::Theme::Light);
+        app.choose_theme(ThemePreference::Dark, &ctx);
+        assert_eq!(ctx.theme(), egui::Theme::Dark);
+        let stored = settings::load(&app.settings_path, temporary.path())?;
+        assert_eq!(stored.theme, ThemePreference::Dark);
+        assert_eq!(stored.index_dir, settings.index_dir);
+        assert_eq!(stored.exclusions, settings.exclusions);
+        assert!(stored.autostart);
+        let restarted = egui::Context::default();
+        apply_theme(&restarted, stored.theme);
+        assert_eq!(restarted.theme(), egui::Theme::Dark);
+        app.choose_theme(ThemePreference::System, &ctx);
+        assert_eq!(
+            ctx.options(|options| options.theme_preference),
+            egui::ThemePreference::System
+        );
+        assert_eq!(
+            settings::load(&app.settings_path, temporary.path())?.theme,
+            ThemePreference::System
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_theme_save_keeps_the_previous_theme() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let settings = Settings::default_for(temporary.path());
+        let mut app = app_for_test(temporary.path(), settings);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx, ThemePreference::System);
+        std::fs::write(app.settings_path.with_extension("tmp"), "occupied")?;
+        app.choose_theme(ThemePreference::Light, &ctx);
+        assert_eq!(app.settings.theme, ThemePreference::System);
+        assert_eq!(
+            ctx.options(|options| options.theme_preference),
+            egui::ThemePreference::System
+        );
+        assert_eq!(app.status, "保存主题设置失败");
+        Ok(())
+    }
+
+    #[test]
+    fn theme_buttons_switch_and_save_at_multiple_dpi_scales() -> anyhow::Result<()> {
+        fn find_text(shape: &egui::Shape, value: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.job.text == value => {
+                    Some(text.pos + text.galley.rect.center().to_vec2())
+                }
+                egui::Shape::Vec(children) => {
+                    children.iter().find_map(|shape| find_text(shape, value))
+                }
+                _ => None,
+            }
+        }
+        for scale in [1.0, 2.0] {
+            let temporary = tempfile::tempdir()?;
+            let settings = Settings::default_for(temporary.path());
+            let mut app = app_for_test(temporary.path(), settings);
+            app.migration_inflight = false;
+            let ctx = egui::Context::default();
+            setup_fonts(&ctx);
+            let mut frame = eframe::Frame::_new_kittest();
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(650.0, 420.0),
+                )),
+                focused: true,
+                ..Default::default()
+            };
+            input
+                .viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default()
+                .native_pixels_per_point = Some(scale);
+            for (label, expected, expected_egui) in [
+                ("暗黑", ThemePreference::Dark, egui::Theme::Dark),
+                ("明亮", ThemePreference::Light, egui::Theme::Light),
+            ] {
+                let mut output = ctx.run_ui(input.clone(), |ui| {
+                    eframe::App::ui(&mut app, ui, &mut frame)
+                });
+                output.textures_delta.clear();
+                let position = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| find_text(&shape.shape, label))
+                    .expect("theme button label");
+                assert!(input.screen_rect.expect("test bounds").contains(position));
+                for pressed in [true, false] {
+                    let mut pointer = input.clone();
+                    pointer.events.push(egui::Event::PointerMoved(position));
+                    pointer.events.push(egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                    let mut output =
+                        ctx.run_ui(pointer, |ui| eframe::App::ui(&mut app, ui, &mut frame));
+                    output.textures_delta.clear();
+                }
+                assert_eq!(app.settings.theme, expected);
+                assert_eq!(ctx.theme(), expected_egui);
+                assert_eq!(
+                    settings::load(&app.settings_path, temporary.path())?.theme,
+                    expected
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn multi_keyword_gui_receives_full_matches_before_partial() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let settings = Settings::default_for(temporary.path());
+        std::fs::create_dir_all(&settings.index_dir)?;
+        let mut db = index::open(&settings.index_dir.join("index.db"))?;
+        for (path, name, time, body) in [
+            ("full", "银河.md", 1, "量子"),
+            ("partial", "其他.md", 2, "银河"),
+        ] {
+            let file = index::FileRecord {
+                path: path.into(),
+                name: name.into(),
+                kind: "markdown".into(),
+                modified_ms: time,
+                size: 1,
+                state: "pending".into(),
+            };
+            index::upsert_metadata(&mut db, &file)?;
+            index::set_body(&mut db, path, time, 1, Some(body), "indexed")?;
+        }
+        drop(db);
+        let mut app = app_for_test(temporary.path(), settings);
+        app.migration_inflight = false;
+        let ctx = egui::Context::default();
+        app.query = "银河 量子".into();
+        app.start_search(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.searching && std::time::Instant::now() < deadline {
+            app.poll(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!app.searching);
+        assert_eq!(
+            app.result
+                .iter()
+                .map(|hit| hit.file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["full", "partial"]
+        );
+        assert_eq!(
+            app.result
+                .iter()
+                .map(|hit| hit.matched_terms)
+                .collect::<Vec<_>>(),
+            [2, 1]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn superseded_search_unblocks_a_full_channel_and_cannot_replace_new_results()
+    -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let settings = Settings::default_for(temporary.path());
+        std::fs::create_dir_all(&settings.index_dir)?;
+        let mut db = index::open(&settings.index_dir.join("index.db"))?;
+        for number in 0..260 {
+            let path = format!("synthetic-{number:03}");
+            let file = index::FileRecord {
+                path: path.clone(),
+                name: format!("{path}.md"),
+                kind: "markdown".into(),
+                modified_ms: number,
+                size: 1,
+                state: "pending".into(),
+            };
+            index::upsert_metadata(&mut db, &file)?;
+            index::set_body(
+                &mut db,
+                &path,
+                number,
+                1,
+                Some(if number == 0 {
+                    "银河星舰"
+                } else {
+                    "银河"
+                }),
+                "indexed",
+            )?;
+        }
+        drop(db);
+        let mut app = app_for_test(temporary.path(), settings);
+        app.migration_inflight = false;
+        let ctx = egui::Context::default();
+        app.query = "银河".into();
+        app.start_search(&ctx);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        app.query = "星舰".into();
+        app.start_search(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while (app.searching || app.active_searches.load(Ordering::SeqCst) != 0)
+            && std::time::Instant::now() < deadline
+        {
+            app.poll(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        app.poll(&ctx);
+        assert!(!app.searching);
+        assert_eq!(app.active_searches.load(Ordering::SeqCst), 0);
+        assert_eq!(app.result.len(), 1);
+        assert_eq!(app.result[0].file.path, "synthetic-000");
+        Ok(())
     }
 
     #[test]

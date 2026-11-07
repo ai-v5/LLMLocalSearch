@@ -44,6 +44,8 @@ pub struct SearchHit {
     pub file: FileRecord,
     pub name_match: bool,
     pub snippet: Option<Snippet>,
+    pub matched_terms: usize,
+    pub total_terms: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -811,18 +813,7 @@ pub fn search_stream(
     if terms.is_empty() {
         return Ok(0);
     }
-    let expression = query::fts_expression(&terms, scope);
     let tx = connection.unchecked_transaction()?;
-    // Sort only IDs and timestamps. Sorting full document bodies would spill large
-    // amounts of text to disk before the first page can be displayed.
-    let ids = {
-        let mut statement = tx.prepare(
-            "SELECT files.id FROM terms JOIN files ON files.id=terms.rowid WHERE terms MATCH ?1
-             ORDER BY files.modified_ms DESC, files.id ASC",
-        )?;
-        let rows = statement.query_map([expression], |r| r.get::<_, i64>(0))?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()?
-    };
     let row_query = if scope == Scope::Name {
         "SELECT id,path,name,kind,modified_ms,size,state,NULL FROM files WHERE id=?1"
     } else {
@@ -831,58 +822,79 @@ pub fn search_stream(
     let mut statement = tx.prepare(row_query)?;
     let mut batch = Vec::with_capacity(50);
     let mut total = 0usize;
-    for id in ids {
-        if cancelled() {
-            break;
+    // Full matches come first. Recheck partial candidates against the original
+    // text: an n-gram candidate for every term need not actually contain them.
+    let mut phases = vec![(true, query::fts_expression(&terms, scope))];
+    if terms.len() > 1 {
+        phases.push((false, query::fts_any_expression(&terms, scope)));
+    }
+    'phases: for (all_terms, expression) in phases {
+        // Sort only IDs, not document bodies, and stream rather than keeping
+        // every candidate ID in a second in-memory vector.
+        let mut ids = tx.prepare(
+            "SELECT files.id FROM terms JOIN files ON files.id=terms.rowid WHERE terms MATCH ?1
+             ORDER BY files.modified_ms DESC, files.id ASC",
+        )?;
+        for id in ids.query_map([expression], |row| row.get::<_, i64>(0))? {
+            if cancelled() {
+                break 'phases;
+            }
+            let mut rows = statement.query([id?])?;
+            let Some(row) = rows.next()? else { continue };
+            let path: String = row.get(1)?;
+            if excluded
+                .iter()
+                .any(|dir| crate::paths::within(Path::new(&path), dir))
+            {
+                continue;
+            }
+            let name: String = row.get(2)?;
+            let kind: String = row.get(3)?;
+            if !kinds.is_empty() && !kinds.contains(&kind) {
+                continue;
+            }
+            let body: Option<String> = if supports_content(&kind) {
+                row.get(7)?
+            } else {
+                None
+            };
+            let matched = query::matched_terms(&terms, &name, body.as_deref().unwrap_or(""), scope);
+            if matched == 0 || (matched == terms.len()) != all_terms {
+                continue;
+            }
+            let name_match = scope != Scope::Content
+                && terms.iter().any(|t| query::normalize(&name).contains(t));
+            let excerpt = if scope != Scope::Name {
+                body.as_deref().and_then(|s| snippet(s, &terms))
+            } else {
+                None
+            };
+            let mut state: String = row.get(6)?;
+            if !supports_content(&kind) && state != "cloud_placeholder" {
+                state = "name_only".into();
+            }
+            batch.push(SearchHit {
+                id: row.get(0)?,
+                file: FileRecord {
+                    path,
+                    name,
+                    kind,
+                    modified_ms: row.get(4)?,
+                    size: row.get::<_, i64>(5)? as u64,
+                    state,
+                },
+                name_match,
+                snippet: excerpt,
+                matched_terms: matched,
+                total_terms: terms.len(),
+            });
+            total += 1;
+            if batch.len() == 50 {
+                emit(std::mem::take(&mut batch));
+            }
         }
-        let mut rows = statement.query([id])?;
-        let Some(row) = rows.next()? else { continue };
-        let path: String = row.get(1)?;
-        if excluded
-            .iter()
-            .any(|dir| crate::paths::within(Path::new(&path), dir))
-        {
-            continue;
-        }
-        let name: String = row.get(2)?;
-        let kind: String = row.get(3)?;
-        if !kinds.is_empty() && !kinds.contains(&kind) {
-            continue;
-        }
-        let body: Option<String> = if supports_content(&kind) {
-            row.get(7)?
-        } else {
-            None
-        };
-        if !query::matches(&terms, &name, body.as_deref().unwrap_or(""), scope) {
-            continue;
-        }
-        let name_match =
-            scope != Scope::Content && terms.iter().any(|t| query::normalize(&name).contains(t));
-        let excerpt = if scope != Scope::Name {
-            body.as_deref().and_then(|s| snippet(s, &terms))
-        } else {
-            None
-        };
-        let mut state: String = row.get(6)?;
-        if !supports_content(&kind) && state != "cloud_placeholder" {
-            state = "name_only".into();
-        }
-        batch.push(SearchHit {
-            id: row.get(0)?,
-            file: FileRecord {
-                path,
-                name,
-                kind,
-                modified_ms: row.get(4)?,
-                size: row.get::<_, i64>(5)? as u64,
-                state,
-            },
-            name_match,
-            snippet: excerpt,
-        });
-        total += 1;
-        if batch.len() == 50 {
+        // Publish even a short full-match batch before sorting partial matches.
+        if !batch.is_empty() {
             emit(std::mem::take(&mut batch));
         }
     }
@@ -1522,6 +1534,255 @@ mod tests {
     }
 
     #[test]
+    fn multiple_keywords_prioritize_full_then_partial_matches() -> Result<()> {
+        let temp = tempdir()?;
+        let mut db = open(&temp.path().join("index.db"))?;
+        for (path, name, modified, body) in [
+            ("full-old", "银河方案.md", 10, "包含量子"),
+            ("full-new", "普通.md", 20, "银河与量子"),
+            ("partial-new", "银河.md", 40, "其他内容"),
+            ("partial-old", "普通2.md", 30, "只有量子"),
+            ("unrelated", "普通3.md", 50, "没有相关词"),
+        ] {
+            upsert_metadata(&mut db, &record(path, name, modified))?;
+            set_body(&mut db, path, modified, 1, Some(body), "indexed")?;
+        }
+        let hits = search(&db, "银河 量子", Scope::Both, &[], &[], || false)?;
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit.file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["full-new", "full-old", "partial-new", "partial-old"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fts_false_full_candidate_can_still_be_a_partial_match() -> Result<()> {
+        let temp = tempdir()?;
+        let mut db = open(&temp.path().join("index.db"))?;
+        upsert_metadata(&mut db, &record("partial", "a.md", 10))?;
+        set_body(&mut db, "partial", 10, 1, Some("alpha aba bab"), "indexed")?;
+        let hits = search(&db, "alpha ababa", Scope::Content, &[], &[], || false)?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].file.path, "partial");
+        Ok(())
+    }
+
+    #[test]
+    fn multiple_keyword_ranking_is_stable_across_batches() -> Result<()> {
+        let temp = tempdir()?;
+        let mut db = open(&temp.path().join("index.db"))?;
+        for number in 0..126 {
+            let full = number < 63;
+            let path = format!("synthetic-{number:03}");
+            let time = if full { 10 } else { 20 };
+            upsert_metadata(&mut db, &record(&path, "synthetic.md", time))?;
+            set_body(
+                &mut db,
+                &path,
+                time,
+                1,
+                Some(if full { "银河量子" } else { "银河" }),
+                "indexed",
+            )?;
+        }
+        let mut batches = Vec::new();
+        let total = search_stream(
+            &db,
+            "银河 量子",
+            Scope::Content,
+            &[],
+            &[],
+            || false,
+            |batch| batches.push(batch),
+        )?;
+        let sizes = batches.iter().map(Vec::len).collect::<Vec<_>>();
+        assert_eq!(sizes, [50, 13, 50, 13]);
+        let hits = batches.into_iter().flatten().collect::<Vec<_>>();
+        assert_eq!(total, 126);
+        assert!(
+            hits[..63]
+                .iter()
+                .all(|hit| hit.matched_terms == 2 && hit.total_terms == 2)
+        );
+        assert!(
+            hits[63..]
+                .iter()
+                .all(|hit| hit.matched_terms == 1 && hit.total_terms == 2)
+        );
+        assert!(hits[..63].windows(2).all(|pair| pair[0].id < pair[1].id));
+        assert!(hits[63..].windows(2).all(|pair| pair[0].id < pair[1].id));
+        assert!(hits[..63].iter().all(|hit| hit.file.modified_ms == 10));
+        assert!(hits[63..].iter().all(|hit| hit.file.modified_ms == 20));
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_search_stops_before_emitting_partial_matches() -> Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let temp = tempdir()?;
+        let mut db = open(&temp.path().join("index.db"))?;
+        for number in 0..65 {
+            let path = format!("synthetic-{number:03}");
+            upsert_metadata(&mut db, &record(&path, "synthetic.md", 1))?;
+            set_body(&mut db, &path, 1, 1, Some("银河量子"), "indexed")?;
+        }
+        upsert_metadata(&mut db, &record("partial", "partial.md", 2))?;
+        set_body(&mut db, "partial", 2, 1, Some("银河"), "indexed")?;
+        let cancelled = AtomicBool::new(false);
+        let mut results = Vec::new();
+        let total = search_stream(
+            &db,
+            "银河 量子",
+            Scope::Content,
+            &[],
+            &[],
+            || cancelled.load(Ordering::SeqCst),
+            |batch| {
+                results.extend(batch);
+                cancelled.store(true, Ordering::SeqCst);
+            },
+        )?;
+        assert_eq!(total, 50);
+        assert_eq!(results.len(), 50);
+        assert!(results.iter().all(|hit| hit.matched_terms == 2));
+        Ok(())
+    }
+
+    #[test]
+    fn partial_results_obey_scope_phrases_and_excluded_content() -> Result<()> {
+        let temp = tempdir()?;
+        let mut db = open(&temp.path().join("index.db"))?;
+        for (path, name, modified, body) in [
+            ("full", "银河 报告.md", 10, "GPU"),
+            ("partial", "普通.md", 20, "银河 报告和CPU"),
+            ("not-phrase", "其他.md", 30, "银河与报告 GPU"),
+        ] {
+            upsert_metadata(&mut db, &record(path, name, modified))?;
+            set_body(&mut db, path, modified, 1, Some(body), "indexed")?;
+        }
+        let both = search(&db, "\"银河 报告\" GPU", Scope::Both, &[], &[], || {
+            false
+        })?;
+        assert_eq!(
+            both.iter()
+                .map(|hit| hit.file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["full", "not-phrase", "partial"]
+        );
+        assert_eq!(
+            both.iter().map(|hit| hit.matched_terms).collect::<Vec<_>>(),
+            [2, 1, 1]
+        );
+        let name = search(&db, "\"银河 报告\" GPU", Scope::Name, &[], &[], || {
+            false
+        })?;
+        assert_eq!(
+            name.iter()
+                .map(|hit| hit.file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["full"]
+        );
+        assert_eq!(name[0].matched_terms, 1);
+        let content = search(&db, "\"银河 报告\" GPU", Scope::Content, &[], &[], || false)?;
+        assert_eq!(
+            content
+                .iter()
+                .map(|hit| hit.file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["not-phrase", "partial", "full"]
+        );
+        assert!(content.iter().all(|hit| hit.matched_terms == 1));
+
+        let old = FileRecord {
+            path: "legacy.txt".into(),
+            name: "银河.txt".into(),
+            kind: "txt".into(),
+            modified_ms: 40,
+            size: 1,
+            state: "pending".into(),
+        };
+        upsert_metadata(&mut db, &old)?;
+        let id: i64 = db.query_row("SELECT id FROM files WHERE path='legacy.txt'", [], |r| {
+            r.get(0)
+        })?;
+        db.execute(
+            "UPDATE files SET body='量子',state='indexed' WHERE id=?1",
+            [id],
+        )?;
+        db.execute("DELETE FROM terms WHERE rowid=?1", [id])?;
+        db.execute(
+            "INSERT INTO terms(rowid,name_grams,body_grams) VALUES(?1,?2,?3)",
+            params![id, query::grams(&old.name), query::grams("量子")],
+        )?;
+        let results = search(&db, "银河 量子", Scope::Both, &[], &[], || false)?;
+        let legacy = results
+            .iter()
+            .find(|hit| hit.file.path == "legacy.txt")
+            .expect("legacy filename");
+        assert_eq!(legacy.matched_terms, 1);
+        assert!(legacy.snippet.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn type_and_directory_filters_apply_to_both_ranking_groups() -> Result<()> {
+        let temp = tempdir()?;
+        let mut db = open(&temp.path().join("index.db"))?;
+        let excluded = temp.path().join("excluded");
+        for (directory, name, body, time) in [
+            ("included", "full.md", "银河量子", 1),
+            ("included", "partial.md", "银河", 2),
+            ("excluded", "excluded-full.md", "银河量子", 3),
+            ("excluded", "excluded-partial.md", "银河", 4),
+        ] {
+            let path = temp
+                .path()
+                .join(directory)
+                .join(name)
+                .to_string_lossy()
+                .into_owned();
+            upsert_metadata(&mut db, &record(&path, name, time))?;
+            set_body(&mut db, &path, time, 1, Some(body), "indexed")?;
+        }
+        let txt_path = temp
+            .path()
+            .join("included")
+            .join("银河.txt")
+            .to_string_lossy()
+            .into_owned();
+        let txt = FileRecord {
+            path: txt_path,
+            name: "银河.txt".into(),
+            kind: "txt".into(),
+            modified_ms: 5,
+            size: 1,
+            state: "name_only".into(),
+        };
+        upsert_metadata(&mut db, &txt)?;
+        let hits = search(
+            &db,
+            "银河 量子",
+            Scope::Both,
+            &["markdown".into()],
+            &[excluded],
+            || false,
+        )?;
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit.file.name.as_str())
+                .collect::<Vec<_>>(),
+            ["full.md", "partial.md"]
+        );
+        assert_eq!(
+            hits.iter().map(|hit| hit.matched_terms).collect::<Vec<_>>(),
+            [2, 1]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn exact_matches_union_fields_order_and_reject_false_candidates() -> Result<()> {
         let temp = tempdir()?;
         let mut db = open(&temp.path().join("index.db"))?;
@@ -1543,7 +1804,7 @@ mod tests {
             hits.iter()
                 .map(|x| x.file.path.as_str())
                 .collect::<Vec<_>>(),
-            ["p2", "p1"]
+            ["p2", "p1", "p3"]
         );
         assert_eq!(
             search(&db, "项", Scope::Content, &[], &[], || false)?.len(),

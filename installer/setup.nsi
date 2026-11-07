@@ -16,11 +16,11 @@ RequestExecutionLevel user
 SetCompressor /SOLID zlib
 Icon "${STAGING_DIR}\icon.ico"
 UninstallIcon "${STAGING_DIR}\icon.ico"
-VIProductVersion "0.1.7.0"
+VIProductVersion "0.1.8.0"
 VIAddVersionKey "ProductName" "LLMLocalSearch"
 VIAddVersionKey "FileDescription" "LLMLocalSearch Setup"
-VIAddVersionKey "ProductVersion" "0.1.7"
-VIAddVersionKey "FileVersion" "0.1.7.0"
+VIAddVersionKey "ProductVersion" "0.1.8"
+VIAddVersionKey "FileVersion" "0.1.8.0"
 VIAddVersionKey "LegalCopyright" "Copyright ai-v5 contributors"
 !define MUI_ABORTWARNING
 !define MUI_ICON "${STAGING_DIR}\icon.ico"
@@ -56,7 +56,7 @@ install_files:
   WriteUninstaller "$INSTDIR\uninstall.exe"
   WriteRegStr HKCU "Software\LLMLocalSearch" "InstallDir" "$INSTDIR"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\LLMLocalSearch" "DisplayName" "LLMLocalSearch"
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\LLMLocalSearch" "DisplayVersion" "0.1.7"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\LLMLocalSearch" "DisplayVersion" "0.1.8"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\LLMLocalSearch" "Publisher" "ai-v5"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\LLMLocalSearch" "InstallLocation" "$INSTDIR"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\LLMLocalSearch" "DisplayIcon" "$INSTDIR\llmlocalsearch.exe"
